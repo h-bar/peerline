@@ -59,6 +59,11 @@
 //!   [`pubsub::classify`] to recognise pubsub messages. The same
 //!   convention is used by Ethereum's `eth_subscribe`, jsonrpsee,
 //!   and many other ecosystems.
+//! - `runtime` *(optional, enable with `runtime` feature)* —
+//!   stateful [`Peer`](runtime::Peer) on top of the pure helpers:
+//!   pending-request map, handler registry, stream registry,
+//!   outbound channel. Runtime-agnostic, built on
+//!   `futures::channel`; works on tokio, async-std, smol, and wasm.
 //!
 //! ### Streaming
 //!
@@ -79,3 +84,8 @@
 pub mod peer;
 pub mod pubsub;
 pub mod wire;
+
+/// Stateful runtime [`Peer`](runtime::Peer) — call / notify /
+/// stream / handler registry. Opt in via the `runtime` feature.
+#[cfg(feature = "runtime")]
+pub mod runtime;

@@ -1,8 +1,9 @@
-//! Runtime-agnostic [`Peer`] on top of the
-//! [`peerline`] pure helpers.
+//! Stateful [`Peer`] built on the pure helpers in
+//! [`crate::peer`] / [`crate::wire`]. Opt in via the `runtime`
+//! feature.
 //!
-//! Where [`peerline`] gives you parsing, classification, and
-//! frame builders, this crate adds the runtime-specific state:
+//! Where the pure layer gives you parsing, classification, and
+//! frame builders, this module adds the connection-level state:
 //!
 //! - **Pending-request map** — outgoing `Request`s waiting on a
 //!   matching `Response`, resolved through `futures::channel::oneshot`.
@@ -20,7 +21,8 @@
 //! takes a `Sink<String>` plus a `Stream<Item = Result<String, _>>`
 //! and returns both the peer handle and a *driver future* the
 //! caller awaits or spawns. The driver runs the dispatch loop
-//! (parse + classify + route via [`InboundKind`]) and the outbound
+//! (parse + classify + route via
+//! [`InboundKind`](crate::peer::InboundKind)) and the outbound
 //! drain side-by-side; it resolves when either half ends.
 //!
 //! ### Cancel-on-drop streams
@@ -32,7 +34,7 @@
 //!
 //! ### Runtime-agnostic
 //!
-//! No tokio dep, no spawn primitive. The crate uses
+//! No tokio dep, no spawn primitive. The module uses
 //! `futures::channel` + `FuturesUnordered` so the driver is a
 //! single `Future` the user runs on whatever executor they prefer
 //! — tokio, async-std, smol, `wasm-bindgen-futures`,
@@ -41,8 +43,6 @@
 //! Wasm-friendly: compiles to `wasm32-unknown-unknown` out of the
 //! box (no `tokio::spawn`, no thread-local runtime handle).
 
-#![warn(missing_docs)]
-
 mod error;
 mod peer;
 mod stream;
@@ -50,11 +50,6 @@ mod stream;
 pub use error::Error;
 pub use peer::{Metrics, Peer};
 pub use stream::{StreamItem, StreamReceiver, StreamSender};
-
-// Re-export commonly-touched bits from the underlying crate so
-// callers don't have to thread both crate names through.
-pub use peerline::peer::{InboundKind, RequestIdGen};
-pub use peerline::wire::{Id, RpcError, StreamFrame};
 
 use futures::stream::StreamExt;
 
@@ -69,11 +64,11 @@ use futures::stream::StreamExt;
 /// transport.
 ///
 /// ```ignore
-/// let (a, b, driver) = peerline_runtime::loopback();
+/// let (a, b, driver) = peerline::runtime::loopback();
 /// tokio::spawn(driver);
 ///
 /// b.on_request("ping", |_: serde_json::Value| async {
-///     Ok::<_, peerline_runtime::RpcError>("pong")
+///     Ok::<_, peerline::wire::RpcError>("pong")
 /// });
 /// let resp: String = a.call("ping", &serde_json::json!([])).await?;
 /// assert_eq!(resp, "pong");

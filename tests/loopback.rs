@@ -3,11 +3,14 @@
 //! Two peers are wired together so each peer's outbound feeds the
 //! other peer's inbound. Tests exercise: unary call/response,
 //! notifications, server-side handlers, streaming RPCs, and
-//! cancel-on-drop semantics. The lib is runtime-agnostic; we use
-//! tokio here only as the test driver.
+//! cancel-on-drop semantics. The runtime module is runtime-agnostic;
+//! we use tokio here only as the test driver.
+
+#![cfg(feature = "runtime")]
 
 use futures::stream::StreamExt;
-use peerline_runtime::{Peer, RpcError, loopback};
+use peerline::runtime::{self, Peer, loopback};
+use peerline::wire::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -45,7 +48,7 @@ async fn call_unknown_method_returns_method_not_found() {
 
     let err = a.call::<_, ()>("nope", &json!({})).await.unwrap_err();
     match err {
-        peerline_runtime::Error::Rpc(rpc_err) => {
+        runtime::Error::Rpc(rpc_err) => {
             assert_eq!(rpc_err.code, peerline::wire::ERR_METHOD_NOT_FOUND);
         }
         other => panic!("expected Rpc error, got {other:?}"),
@@ -69,7 +72,7 @@ async fn call_handler_error_propagates() {
         .await
         .unwrap_err();
     match err {
-        peerline_runtime::Error::Rpc(rpc_err) => assert_eq!(rpc_err.code, -32000),
+        runtime::Error::Rpc(rpc_err) => assert_eq!(rpc_err.code, -32000),
         other => panic!("expected Rpc error, got {other:?}"),
     }
 }
@@ -158,7 +161,7 @@ async fn call_stream_yields_items_until_close() {
 
     let mut items: Vec<u32> = Vec::new();
     let mut seqs: Vec<u64> = Vec::new();
-    let mut stream: peerline_runtime::StreamReceiver<u32> =
+    let mut stream: runtime::StreamReceiver<u32> =
         a.call_stream("count", &CountQuery { n: 5 }).unwrap();
     while let Some(item) = stream.next().await {
         let item = item.unwrap();
@@ -179,7 +182,7 @@ async fn call_stream_propagates_handler_error() {
         sender.error(-32000, "kaboom").unwrap();
     });
 
-    let mut stream: peerline_runtime::StreamReceiver<String> =
+    let mut stream: runtime::StreamReceiver<String> =
         a.call_stream("boom", &json!([])).unwrap();
 
     // First yield: the item
@@ -190,7 +193,7 @@ async fn call_stream_propagates_handler_error() {
     // Second yield: the error
     let second = stream.next().await.unwrap();
     match second {
-        Err(peerline_runtime::Error::Rpc(e)) => {
+        Err(runtime::Error::Rpc(e)) => {
             assert_eq!(e.code, -32000);
             assert_eq!(e.message, "kaboom");
         }
@@ -221,7 +224,7 @@ async fn dropping_stream_receiver_sends_cancel_upstream() {
     });
 
     {
-        let _stream: peerline_runtime::StreamReceiver<String> =
+        let _stream: runtime::StreamReceiver<String> =
             a.call_stream("tail", &json!([])).unwrap();
         // Drop happens at end of scope — sends stream:cancel.
     }

@@ -1,9 +1,9 @@
 //! Error type for runtime-level Peer operations.
 
-use peerline::wire::RpcError;
+use crate::wire::RpcError;
 use thiserror::Error;
 
-/// Errors surfaced by [`crate::Peer`] methods.
+/// Errors surfaced by [`super::Peer`] methods.
 #[derive(Debug, Error)]
 pub enum Error {
     /// The peer returned an RPC error response.
@@ -22,7 +22,7 @@ pub enum Error {
     Abandoned,
     /// A method that was supposed to return params-as-Object/Array
     /// got a scalar / null / bool. Reflected from
-    /// [`peerline::peer::request`].
+    /// [`crate::peer::request`].
     #[error("params: {0}")]
     Params(String),
 }

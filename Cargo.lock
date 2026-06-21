@@ -94,16 +94,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 name = "peerline"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "peerline-runtime"
-version = "0.1.0"
-dependencies = [
  "futures",
- "peerline",
  "serde",
  "serde_json",
  "thiserror",

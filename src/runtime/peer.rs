@@ -10,18 +10,18 @@
 //! whatever executor they prefer — tokio, async-std, smol,
 //! `wasm-bindgen-futures`, `futures::executor::block_on`, …
 
-use crate::error::Error;
-use crate::stream::{StreamReceiver, StreamSender};
+use super::error::Error;
+use super::stream::{StreamReceiver, StreamSender};
+use crate::peer as p;
+use crate::peer::{InboundKind, RequestIdGen};
+use crate::wire::{
+    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, Frame, Id, Notification, Params,
+    Request, Response, RpcError, StreamFrame,
+};
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
-use peerline::peer as p;
-use peerline::peer::{InboundKind, RequestIdGen};
-use peerline::wire::{
-    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, Frame, Id, Notification, Params,
-    Request, Response, RpcError, StreamFrame,
-};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,7 +60,7 @@ pub(crate) struct PeerInner {
     pub(crate) outbound: mpsc::UnboundedSender<String>,
     /// Number of frames queued in `outbound` that haven't been
     /// drained by the wire writer yet. Bumped by [`send_frame`] /
-    /// [`crate::stream`]'s send paths; decremented by
+    /// [`super::stream`]'s send paths; decremented by
     /// [`forward_outbound`]. Surfaces in [`Peer::metrics`] so
     /// operators can spot a slow / dead client (TCP send blocked)
     /// before the unbounded queue eats memory.

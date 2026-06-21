@@ -1,12 +1,27 @@
-[workspace]
-resolver = "2"
-members = ["peerline", "peerline-runtime"]
-
-[workspace.package]
+[package]
+name = "peerline"
+description = "Peer-symmetric JSON framing toolkit — bidirectional request/response/notification/stream envelopes with a pubsub layer, plus an optional stateful Peer runtime"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[workspace.dependencies]
+[features]
+default = []
+# Stateful Peer with call / notify / stream / handler registry,
+# built on `futures::channel`. Runtime-agnostic — works on tokio,
+# async-std, smol, and wasm. Opt in if you want the `runtime`
+# module; leave off for pure wire types only.
+runtime = ["dep:futures", "dep:thiserror"]
+
+[dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+# futures::channel (mpsc/oneshot) + FuturesUnordered let us run
+# handlers concurrently without needing a runtime's spawn primitive.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+# Drives the loopback driver in tests under the `runtime` feature.
+tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

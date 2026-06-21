@@ -1,12 +1,12 @@
 //! Stream-side wrappers for peerline's streaming layer.
 
-use crate::error::Error;
-use crate::peer::{PeerInner, send_frame};
+use super::error::Error;
+use super::peer::{PeerInner, send_frame};
+use crate::peer as p;
+use crate::wire::{Frame, Id, StreamFrame};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::stream::Stream;
-use peerline::peer as p;
-use peerline::wire::{Frame, Id, StreamFrame};
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::pin::Pin;
