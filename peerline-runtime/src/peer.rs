@@ -16,9 +16,9 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
-use jsonrpc_rust::peer as p;
-use jsonrpc_rust::peer::{InboundKind, RequestIdGen};
-use jsonrpc_rust::wire::{
+use peerline::peer as p;
+use peerline::peer::{InboundKind, RequestIdGen};
+use peerline::wire::{
     ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, Frame, Id, Notification, Params,
     Request, Response, RpcError, StreamFrame,
 };
@@ -204,7 +204,7 @@ impl Peer {
     // Outgoing: call / notify / call_stream
     // -----------------------------------------------------------------------
 
-    /// Issue a JSON-RPC request and await the typed response.
+    /// Issue a request and await the typed response.
     pub async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, Error>
     where
         P: Serialize,
@@ -290,8 +290,8 @@ impl Peer {
     }
 
     /// Register a handler for incoming notifications on `method`.
-    /// Notifications produce no reply per spec §4.1; errors inside
-    /// the handler are not surfaced over the wire.
+    /// Notifications produce no reply; errors inside the handler
+    /// are not surfaced over the wire.
     pub fn on_notification<P, F, Fut>(&self, method: impl Into<String>, f: F)
     where
         P: DeserializeOwned + Send + 'static,

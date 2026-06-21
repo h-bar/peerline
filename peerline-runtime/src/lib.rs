@@ -1,7 +1,7 @@
 //! Runtime-agnostic [`Peer`] on top of the
-//! [`jsonrpc_rust`] pure helpers.
+//! [`peerline`] pure helpers.
 //!
-//! Where [`jsonrpc_rust`] gives you parsing, classification, and
+//! Where [`peerline`] gives you parsing, classification, and
 //! frame builders, this crate adds the runtime-specific state:
 //!
 //! - **Pending-request map** — outgoing `Request`s waiting on a
@@ -53,8 +53,8 @@ pub use stream::{StreamItem, StreamReceiver, StreamSender};
 
 // Re-export commonly-touched bits from the underlying crate so
 // callers don't have to thread both crate names through.
-pub use jsonrpc_rust::peer::{InboundKind, RequestIdGen};
-pub use jsonrpc_rust::wire::{Id, RpcError, StreamFrame};
+pub use peerline::peer::{InboundKind, RequestIdGen};
+pub use peerline::wire::{Id, RpcError, StreamFrame};
 
 use futures::stream::StreamExt;
 
@@ -65,15 +65,15 @@ use futures::stream::StreamExt;
 /// dispatch loop.
 ///
 /// Useful for tests, in-process plugin architectures, or anywhere
-/// you'd otherwise pipe a JSON-RPC connection through an external
+/// you'd otherwise pipe a peerline connection through an external
 /// transport.
 ///
 /// ```ignore
-/// let (a, b, driver) = jsonrpc_rust_runtime::loopback();
+/// let (a, b, driver) = peerline_runtime::loopback();
 /// tokio::spawn(driver);
 ///
 /// b.on_request("ping", |_: serde_json::Value| async {
-///     Ok::<_, jsonrpc_rust_runtime::RpcError>("pong")
+///     Ok::<_, peerline_runtime::RpcError>("pong")
 /// });
 /// let resp: String = a.call("ping", &serde_json::json!([])).await?;
 /// assert_eq!(resp, "pong");

@@ -1,6 +1,6 @@
 //! Error type for runtime-level Peer operations.
 
-use jsonrpc_rust::wire::RpcError;
+use peerline::wire::RpcError;
 use thiserror::Error;
 
 /// Errors surfaced by [`crate::Peer`] methods.
@@ -22,7 +22,7 @@ pub enum Error {
     Abandoned,
     /// A method that was supposed to return params-as-Object/Array
     /// got a scalar / null / bool. Reflected from
-    /// [`jsonrpc_rust::peer::request`].
+    /// [`peerline::peer::request`].
     #[error("params: {0}")]
     Params(String),
 }

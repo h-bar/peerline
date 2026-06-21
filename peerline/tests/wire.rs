@@ -1,7 +1,7 @@
-//! Spec-conformance round-trip tests for the peer-symmetric core.
+//! Wire-shape round-trip tests for the peer-symmetric core.
 
-use jsonrpc_rust::peer::{self, InboundKind};
-use jsonrpc_rust::wire::{
+use peerline::peer::{self, InboundKind};
+use peerline::wire::{
     self, ERR_INVALID_REQUEST, ERR_PARSE, Frame, Id, Params, Request, Response, ResponseErr,
     RpcError,
 };
@@ -42,7 +42,7 @@ fn id_round_trips() {
 #[test]
 fn err_response_serializes_none_id_as_null() {
     // Only the Err variant carries Option<Id>; the parse-error case
-    // (id: None) must wire as JSON null per spec §5.
+    // (id: None) must wire as JSON null.
     let r = Response::Err(ResponseErr {
         jsonrpc: Some("2.0".into()),
         id: None,
@@ -178,8 +178,9 @@ fn parse_frame_classifies_notification() {
 
 #[test]
 fn parse_frame_treats_null_id_as_notification() {
-    // Per spec §4.1, id:null is discouraged on requests — we
-    // normalize to no-id (Notification) before deserialize.
+    // peerline normalizes id:null to no-id (Notification) before
+    // deserialize, so requests with an explicit null id classify as
+    // notifications rather than failing.
     let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping","id":null}"#).unwrap();
     assert!(matches!(frame, Frame::Notification(_)));
 }

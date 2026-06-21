@@ -1,12 +1,12 @@
 [package]
-name = "jsonrpc-rust-runtime"
-description = "Stateful Peer on top of the jsonrpc-rust toolkit — call / notify / stream / handler registry. Runtime-agnostic, works on tokio, async-std, smol, and wasm."
+name = "peerline-runtime"
+description = "Stateful Peer on top of the peerline toolkit — call / notify / stream / handler registry. Runtime-agnostic, works on tokio, async-std, smol, and wasm."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-jsonrpc-rust = { path = "../jsonrpc-rust" }
+peerline = { path = "../peerline" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # futures::channel (mpsc/oneshot) + FuturesUnordered let us run

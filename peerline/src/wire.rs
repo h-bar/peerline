@@ -1,67 +1,92 @@
-//! JSON-RPC 2.0 wire types — strictly spec-aligned.
+//! peerline wire types — the envelopes that cross the wire.
 //!
-//! Everything in this module is defined by the
-//! [2.0 spec](https://www.jsonrpc.org/specification). Extensions
-//! (pubsub subscription envelopes, etc.) live in [`crate::pubsub`].
+//! peerline defines four frame envelopes — [`Request`], [`Response`],
+//! [`Notification`], [`StreamFrame`] — unified under [`Frame`].
+//! Either peer can send any envelope at any time.
 //!
-//! Where the spec allows a range of values, this crate picks the
-//! strictest spec-compatible interpretation:
+//! ### Strict typing
+//!
+//! Where a field has multiple valid shapes, peerline picks the
+//! strictest typed representation:
 //!
 //! - [`Request.id`](Request) is typed [`Id`] — `String` or `Number`
-//!   only. Fractional numbers are rejected at parse time. The third
-//!   spec-allowed value, `Null`, is modelled as `Option<Id>::None`.
+//!   only. Fractional numbers are rejected at parse time. Null id is
+//!   modelled as `Option<Id>::None`.
 //! - [`Request.params`](Request) is typed [`Params`] — only `Array`
-//!   (positional) or `Object` (named) values, as required by §4.2.
-//! - [`Response`] is a `Result`-shaped enum: the `result` / `error`
-//!   mutual exclusion of §5 is enforced at the type level.
-//! - [`RpcError`] carries the optional `data` field from §5.
-//! - Batching (spec §6) is intentionally not in the wire types —
-//!   it's a transport-layer framing concern (multiple frames in one
-//!   wire message). See [`Frame`] for details.
-//! - `Request` / `Response` / `Notification` all carry
-//!   `deny_unknown_fields`, so extension fields don't silently
+//!   (positional) or `Object` (named) values. Scalars / booleans /
+//!   `null` are rejected at parse time.
+//! - [`Response`] is a `Result`-shaped enum: the success/error
+//!   mutual exclusion is enforced at the type level — a single
+//!   response can only be one or the other, never both, never
+//!   neither.
+//! - [`RpcError`] carries an optional `data` field for
+//!   application-defined payloads.
+//! - `Request` / `Response` / `Notification` / `StreamFrame` all
+//!   carry `deny_unknown_fields`, so stray fields don't silently
 //!   sneak through into the typed envelopes.
 //!
-//! Symmetric: every envelope derives both [`serde::Serialize`] and
-//! [`serde::Deserialize`] so the same struct definitions work on
-//! both ends of the connection. Direction-specific helpers live in
-//! [`crate::server`] and [`crate::client`].
+//! ### Single-frame wire
+//!
+//! Packing multiple frames into one wire message (a JSON array of
+//! frames, for example) is a transport-layer framing concern, not a
+//! wire-type concern. Transports that batch split the wire array
+//! into individual frame strings and call
+//! [`crate::peer::parse_frame`] on each. See [`Frame`] for details.
+//!
+//! ### Symmetric
+//!
+//! Every envelope derives both [`serde::Serialize`] and
+//! [`serde::Deserialize`], so the same struct definitions work on
+//! both ends of the connection. Send and receive helpers live in
+//! [`crate::peer`].
+//!
+//! ### JSON-RPC 2.0 interop
+//!
+//! [`Request`] / [`Response`] / [`Notification`] are wire-compatible
+//! with JSON-RPC 2.0. peerline emits `"jsonrpc": "2.0"` on outbound
+//! frames so vanilla JSON-RPC tooling decodes the basic three
+//! envelopes without modification, and accepts the field as optional
+//! on inbound frames so peers that omit it decode cleanly. The
+//! [`Id`] / [`Params`] / [`Response`] constraints above happen to
+//! match the JSON-RPC 2.0 wire shape; [`StreamFrame`] is
+//! peerline-specific.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// The `jsonrpc` field every envelope carries when emitted by this
-/// crate. Peers may omit the field on the wire — see
+/// The protocol-version marker peerline emits on outbound frames.
+/// Fixed at `"2.0"` for wire compatibility with JSON-RPC 2.0
+/// tooling. Peers may omit the field on the wire — see
 /// [`Request::jsonrpc`] for the receive-side behaviour.
 pub const JSONRPC_VERSION: &str = "2.0";
 
-/// Standard JSON-RPC 2.0 error code: invalid JSON was received.
+/// Standard error code: invalid JSON was received.
 pub const ERR_PARSE: i32 = -32700;
-/// Standard JSON-RPC 2.0 error code: the JSON sent is not a valid
-/// Request object.
+/// Standard error code: the JSON sent is not a valid Request
+/// object.
 pub const ERR_INVALID_REQUEST: i32 = -32600;
-/// Standard JSON-RPC 2.0 error code: the method does not exist or is
-/// not available.
+/// Standard error code: the method does not exist or is not
+/// available.
 pub const ERR_METHOD_NOT_FOUND: i32 = -32601;
-/// Standard JSON-RPC 2.0 error code: invalid method parameter(s).
+/// Standard error code: invalid method parameter(s).
 pub const ERR_INVALID_PARAMS: i32 = -32602;
-/// Standard JSON-RPC 2.0 error code: internal JSON-RPC error.
+/// Standard error code: internal protocol error.
 pub const ERR_INTERNAL: i32 = -32603;
 
 // ---------------------------------------------------------------------------
-// Id — spec §4.1 / §5
+// Id
 // ---------------------------------------------------------------------------
 
-/// JSON-RPC 2.0 identifier — `String` or `Number` per spec §4.1.
+/// Request / response identifier — `String` or `Number`.
 /// Fractional numbers are rejected at deserialize time (serde's
-/// integer deserialization errors on floats), matching the spec's
-/// "SHOULD NOT contain fractional parts" rule.
+/// integer deserialization errors on floats), matching peerline's
+/// "no fractional ids" rule.
 ///
-/// The spec's third allowed id value, `Null`, is modelled as
-/// `Option<Id>::None` rather than a variant here — both [`Request.id`]
-/// and [`Response.id`] are `Option<Id>` (`None` ⇒ JSON null on the
-/// wire). That keeps this enum clean and lets [`HashMap`](std::collections::HashMap)
-/// key directly on it for client-side pending-request registries.
+/// A wire-level `null` id is modelled as `Option<Id>::None` rather
+/// than a variant here — both [`Request.id`] and [`Response.id`] are
+/// `Option<Id>` (`None` ⇒ JSON null on the wire). That keeps this
+/// enum clean and lets [`HashMap`](std::collections::HashMap) key
+/// directly on it for the pending-request registry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Id {
@@ -74,7 +99,7 @@ pub enum Id {
 impl Id {
     /// Extract the id as a non-negative integer, if this is
     /// `Id::Number(n)` with `n >= 0`. Convenience for callers that
-    /// only ever issue `u64` ids via [`crate::client::RequestIdGen`].
+    /// only ever issue `u64` ids via [`crate::peer::RequestIdGen`].
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -127,13 +152,13 @@ impl From<&str> for Id {
 }
 
 // ---------------------------------------------------------------------------
-// Params — spec §4.2 (Structured value: Array or Object)
+// Params
 // ---------------------------------------------------------------------------
 
-/// JSON-RPC 2.0 method parameters — `Array` (positional) or `Object`
-/// (named) per spec §4.2. Scalars, booleans, and `null` are rejected
-/// at parse time. The field is optional on [`Request`], so users
-/// typically wrap this in `Option<Params>`.
+/// Method parameters — `Array` (positional) or `Object` (named).
+/// Scalars, booleans, and `null` are rejected at parse time. The
+/// field is optional on [`Request`], so users typically wrap this
+/// in `Option<Params>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Params {
@@ -167,14 +192,14 @@ impl Params {
 }
 
 // ---------------------------------------------------------------------------
-// Request / Response / Notification — spec §4 / §5
+// Request / Response / Notification
 // ---------------------------------------------------------------------------
 
-/// One JSON-RPC 2.0 request per spec §4 — a call from the client
-/// that **expects a response**. `id` is REQUIRED and non-null
-/// (`Number` or `String`). For one-way calls that don't want a
-/// response, use [`Notification`] instead — they're distinct Rust
-/// types so direction-typed dispatch is enforced by the type system.
+/// A call from one peer that **expects a response**. `id` is
+/// REQUIRED and non-null (`Number` or `String`). For one-way calls
+/// that don't want a response, use [`Notification`] instead —
+/// they're distinct Rust types so direction-typed dispatch is
+/// enforced by the type system.
 ///
 /// `#[serde(deny_unknown_fields)]` keeps the wire-shape strict: a
 /// Response or Notification frame mistakenly sent in the request
@@ -182,17 +207,16 @@ impl Params {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-    /// omitted the field on the wire (codex app-server and some MCP
-    /// transports do so). Not validated on parse; callers who want
-    /// spec-strict behaviour can call [`validate_version`] themselves.
+    /// `Some("2.0")` when peerline (or a JSON-RPC 2.0 peer) sent the
+    /// frame; `None` when the peer omitted the field on the wire
+    /// (codex app-server and some MCP transports do so). Not
+    /// validated on parse; callers who want strict version
+    /// enforcement can call [`validate_version`] themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<String>,
-    /// Caller-chosen request id — REQUIRED, non-null per spec §4.1.
-    /// The spec discourages `null` here ("a value of Null is
-    /// discouraged because this specification uses a value of Null
-    /// for Responses with an unknown id"); our [`server::parse_inbound`](crate::server::parse_inbound)
-    /// treats wire `id: null` as no-id (i.e. a [`Notification`]).
+    /// Caller-chosen request id — REQUIRED and non-null. A null id
+    /// on the wire is treated as no-id (i.e. a [`Notification`]) by
+    /// [`crate::peer::parse_frame`].
     pub id: Id,
     /// The method name being invoked.
     pub method: String,
@@ -202,9 +226,8 @@ pub struct Request {
     pub params: Option<Params>,
 }
 
-/// One JSON-RPC 2.0 response — what a server sends and a client
-/// receives. The `result` / `error` mutual exclusion required by
-/// spec §5 is enforced **at the type level**: this is a `Result`-
+/// A reply to a [`Request`]. The `result` / `error` mutual
+/// exclusion is enforced **at the type level**: this is a `Result`-
 /// shaped enum, so a single response can only be one or the other,
 /// never both, never neither.
 ///
@@ -225,22 +248,23 @@ pub enum Response {
 
 /// Body of a successful [`Response`] — `jsonrpc`, `id`, `result`.
 /// `deny_unknown_fields` rejects frames that also carry an `error`
-/// field (which would violate spec §5 mutual exclusion).
+/// field (which would violate the success/error mutual exclusion).
 ///
-/// `id` is non-optional (`Id`, not `Option<Id>`): per spec §5, the
-/// only case where a response carries `null` id is when the server
+/// `id` is non-optional (`Id`, not `Option<Id>`): the only case
+/// where a response carries `null` id is when the responder
 /// couldn't recover the id from a malformed request — by definition
 /// an *error*, not a success. A successful response always knows
 /// the id it's replying to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseOk {
-    /// `Some("2.0")` per JSON-RPC §5; `None` when the peer omitted
-    /// the field on the wire. See [`Request::jsonrpc`].
+    /// `Some("2.0")` when peerline (or a JSON-RPC 2.0 peer) sent the
+    /// frame; `None` when the peer omitted the field on the wire.
+    /// See [`Request::jsonrpc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<String>,
-    /// Echoes the request's `id`. Non-null per spec §5 — successful
-    /// responses always know the id.
+    /// Echoes the request's `id`. Non-null — successful responses
+    /// always know the id.
     pub id: Id,
     /// Success payload.
     pub result: Value,
@@ -248,18 +272,18 @@ pub struct ResponseOk {
 
 /// Body of an error [`Response`] — `jsonrpc`, `id`, `error`.
 /// `deny_unknown_fields` rejects frames that also carry a `result`
-/// field (which would violate spec §5 mutual exclusion).
+/// field (which would violate the success/error mutual exclusion).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseErr {
-    /// `Some("2.0")` per JSON-RPC §5; `None` when the peer omitted
-    /// the field on the wire. See [`Request::jsonrpc`].
+    /// `Some("2.0")` when peerline (or a JSON-RPC 2.0 peer) sent the
+    /// frame; `None` when the peer omitted the field on the wire.
+    /// See [`Request::jsonrpc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<String>,
     /// Echoes the request's `id`. `None` ⇒ JSON `null` on the wire
-    /// (mandatory when the server couldn't recover an id from a
-    /// malformed request per spec §5 — the only place null id is
-    /// allowed).
+    /// (the only place null id is allowed: when the responder
+    /// couldn't recover an id from a malformed request).
     pub id: Option<Id>,
     /// Error payload.
     pub error: RpcError,
@@ -269,8 +293,8 @@ impl Response {
     /// The response's `id` field, regardless of variant. Returns
     /// `Some` for [`Response::Ok`] (always non-null by type) and for
     /// [`Response::Err`] with a recovered id; `None` only for an
-    /// `Err` response constructed for the spec §5 parse-error case
-    /// (wire `id: null`).
+    /// `Err` response built for the malformed-request case (wire
+    /// `id: null`).
     #[must_use]
     pub fn id(&self) -> Option<&Id> {
         match self {
@@ -279,8 +303,8 @@ impl Response {
         }
     }
 
-    /// The `jsonrpc` version string, regardless of variant. `None`
-    /// when the peer omitted the field on the wire.
+    /// The protocol-version field, regardless of variant. `None`
+    /// when the peer omitted it on the wire.
     #[must_use]
     pub fn jsonrpc(&self) -> Option<&str> {
         match self {
@@ -320,7 +344,7 @@ impl Response {
     }
 
     /// Consume the response into a Rust [`Result`]. Useful in the
-    /// client-side routing path where downstream code only cares
+    /// receive-side routing path where downstream code only cares
     /// about success vs failure, not the envelope around it.
     pub fn into_outcome(self) -> Result<Value, RpcError> {
         match self {
@@ -330,26 +354,20 @@ impl Response {
     }
 }
 
-/// One JSON-RPC 2.0 notification per spec §4.1 — a one-way call
-/// without an `id` member. Signals that the client doesn't want a
-/// response; the server MUST NOT send one.
-///
-/// **Direction is client → server only.** The spec describes
-/// Notifications as a thing clients send; it does not define
-/// server-initiated notifications. The server-push pattern used by
-/// our pubsub extension uses [`crate::pubsub::Event`] instead — same
-/// wire shape, but a distinct Rust type so direction confusion is
-/// impossible.
+/// A one-way call without an `id` member — no reply expected, the
+/// other peer MUST NOT send one.
 ///
 /// A separate Rust type from [`Request`] (not a `Request` with
 /// `id = None`): this means the type system enforces "Notifications
 /// don't get responses" — handlers that consume a [`Notification`]
-/// can't accidentally return a [`Response`] for it.
+/// can't accidentally return a [`Response`] for it. Either peer can
+/// send a notification at any time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notification {
-    /// `Some("2.0")` per JSON-RPC §4.1; `None` when the peer omitted
-    /// the field on the wire. See [`Request::jsonrpc`].
+    /// `Some("2.0")` when peerline (or a JSON-RPC 2.0 peer) sent the
+    /// frame; `None` when the peer omitted the field on the wire.
+    /// See [`Request::jsonrpc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<String>,
     /// The notification method name.
@@ -360,19 +378,19 @@ pub struct Notification {
     pub params: Option<Params>,
 }
 
-/// JSON-RPC 2.0 error object per spec §5 — the body of
-/// [`Response::Err`]. The `data` field is optional and carries
-/// arbitrary application-specific information.
+/// Error object — the body of [`Response::Err`]. The `data` field
+/// is optional and carries arbitrary application-specific
+/// information.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcError {
-    /// One of the [`ERR_PARSE`] / [`ERR_INVALID_REQUEST`] / … constants
-    /// or an application-range value (`-32000` to `-32099` are
-    /// reserved for application use).
+    /// One of the [`ERR_PARSE`] / [`ERR_INVALID_REQUEST`] / …
+    /// constants or an application-range value (`-32000` to
+    /// `-32099` are reserved for application use).
     pub code: i32,
     /// Human-readable error message.
     pub message: String,
-    /// Optional application-defined data — anything from a Sentry id
-    /// to a structured validation failure.
+    /// Optional application-defined data — anything from a Sentry
+    /// id to a structured validation failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
@@ -381,17 +399,14 @@ pub struct RpcError {
 // Frame — single-frame wire envelope, peer-symmetric
 // ---------------------------------------------------------------------------
 
-/// Anything that crosses the wire as one JSON-RPC 2.0 frame, in
-/// either direction. JSON-RPC 2.0 is symmetric on the wire — the
-/// spec's "Client" and "Server" labels apply to *roles in one RPC
-/// call*, not to endpoints. Either peer may send any of these
-/// frames.
+/// Anything that crosses the wire as one peerline frame, in either
+/// direction. Both peers may send any variant — there is no
+/// "client"-only or "server"-only frame.
 ///
-/// **Batching is intentionally not modelled here.** Spec §6's batch
-/// format (an array of frames in one message) is a transport-layer
-/// framing concern — packing multiple [`Frame`]s into one wire
-/// message and unpacking on receipt is the transport's job, not the
-/// wire type's. Consumers that need batching split the wire message
+/// **Batching is intentionally not modelled here.** Packing multiple
+/// [`Frame`]s into one wire message (a JSON array of frames, for
+/// example) is a transport-layer framing concern — the transport's
+/// job, not the wire type's. Transports that batch split the array
 /// into individual frame strings and call [`crate::peer::parse_frame`]
 /// on each.
 ///
@@ -402,7 +417,7 @@ pub struct RpcError {
 /// so a malformed frame can't accidentally land in a too-permissive
 /// variant:
 ///
-/// 1. `Stream` — must have `id` AND `stream` (extension; not 2.0).
+/// 1. `Stream` — must have `id` AND `stream`.
 /// 2. `Response` — must have `id` AND (`result` xor `error`).
 /// 3. `Request` — must have `id` AND `method`.
 /// 4. `Notification` — must have `method`, must NOT have `id`.
@@ -419,7 +434,7 @@ pub struct RpcError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Frame {
-    /// A streaming-lifecycle frame (extension — see [`StreamFrame`]).
+    /// A streaming-lifecycle frame (see [`StreamFrame`]).
     Stream(StreamFrame),
     /// A reply to a [`Request`] this peer (or the other peer) sent.
     Response(Response),
@@ -430,7 +445,7 @@ pub enum Frame {
 }
 
 // ---------------------------------------------------------------------------
-// StreamFrame — proposed JSON-RPC 2.1 streaming extension
+// StreamFrame
 // ---------------------------------------------------------------------------
 
 /// One streaming-lifecycle frame, modelled as a phase-per-variant
@@ -439,11 +454,11 @@ pub enum Frame {
 /// `error` ⇔ `Error` invariants — there is no malformed
 /// `StreamFrame` value to construct in Rust.
 ///
-/// **Not part of JSON-RPC 2.0.** This is the proposed 2.1 streaming
-/// extension. The `jsonrpc` field still says `"2.0"` on the wire
-/// for backwards compatibility with peers that ignore unknown
-/// frames; 2.1-aware peers recognise the `stream` field as the
-/// streaming-extension marker.
+/// Streaming is peerline-specific — it has no JSON-RPC 2.0
+/// counterpart. The `jsonrpc` field still says `"2.0"` on the wire
+/// so peers that ignore unknown frames silently drop it without
+/// erroring; peerline-aware peers recognise the `stream` field as
+/// the streaming marker.
 ///
 /// All frames correlate to the originating [`Request`] by `id`.
 /// Both peers can send any variant — streams are bidi-capable with
@@ -487,8 +502,9 @@ pub enum StreamFrame {
     /// has data ready — `Open` is useful as an early ack when
     /// producing the first item is slow.
     Open {
-        /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-        /// omitted the field on the wire. See [`Request::jsonrpc`].
+        /// Protocol-version marker (`Some("2.0")` when emitted by
+        /// peerline; `None` when the peer omitted the field on the
+        /// wire). See [`Request::jsonrpc`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jsonrpc: Option<String>,
         /// Correlates to the originating [`Request`].
@@ -496,8 +512,9 @@ pub enum StreamFrame {
     },
     /// One element of the sender's outgoing half-stream.
     Item {
-        /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-        /// omitted the field on the wire. See [`Request::jsonrpc`].
+        /// Protocol-version marker (`Some("2.0")` when emitted by
+        /// peerline; `None` when the peer omitted the field on the
+        /// wire). See [`Request::jsonrpc`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jsonrpc: Option<String>,
         /// Correlates to the originating [`Request`].
@@ -518,8 +535,9 @@ pub enum StreamFrame {
     /// The other side may still send. Stream is `DONE` only when
     /// both halves are closed.
     Close {
-        /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-        /// omitted the field on the wire. See [`Request::jsonrpc`].
+        /// Protocol-version marker (`Some("2.0")` when emitted by
+        /// peerline; `None` when the peer omitted the field on the
+        /// wire). See [`Request::jsonrpc`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jsonrpc: Option<String>,
         /// Correlates to the originating [`Request`].
@@ -528,8 +546,9 @@ pub enum StreamFrame {
     /// Abnormal half-close with `error` populated — the sender
     /// failed on its side.
     Error {
-        /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-        /// omitted the field on the wire. See [`Request::jsonrpc`].
+        /// Protocol-version marker (`Some("2.0")` when emitted by
+        /// peerline; `None` when the peer omitted the field on the
+        /// wire). See [`Request::jsonrpc`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jsonrpc: Option<String>,
         /// Correlates to the originating [`Request`].
@@ -541,8 +560,9 @@ pub enum StreamFrame {
     /// immediately and discards anything in-flight. Either peer
     /// may send.
     Cancel {
-        /// `Some("2.0")` per JSON-RPC §4 / §5; `None` when the peer
-        /// omitted the field on the wire. See [`Request::jsonrpc`].
+        /// Protocol-version marker (`Some("2.0")` when emitted by
+        /// peerline; `None` when the peer omitted the field on the
+        /// wire). See [`Request::jsonrpc`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jsonrpc: Option<String>,
         /// Correlates to the originating [`Request`].
@@ -565,8 +585,8 @@ impl StreamFrame {
         }
     }
 
-    /// The `jsonrpc` field, regardless of variant. `None` when the
-    /// peer omitted it on the wire.
+    /// The protocol-version field, regardless of variant. `None`
+    /// when the peer omitted it on the wire.
     #[must_use]
     pub fn jsonrpc(&self) -> Option<&str> {
         match self {
@@ -582,11 +602,11 @@ impl StreamFrame {
 // ---------------------------------------------------------------------------
 // Version validation — opt-in helper. The parse path treats the
 // `jsonrpc` field as optional (defaulting to `"2.0"` when absent) for
-// maximum interop; callers who want spec-strict behaviour call this
+// maximum interop; callers who want strict behaviour call this
 // directly on the parsed frame.
 // ---------------------------------------------------------------------------
 
-/// Check that `jsonrpc` is exactly `"2.0"` per spec §4 / §5.
+/// Check that the protocol-version marker is exactly `"2.0"`.
 ///
 /// Returns `Ok(())` on a match; otherwise an `Err` whose message is
 /// suitable for the `message` field of a `-32600` InvalidRequest

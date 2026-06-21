@@ -7,7 +7,7 @@
 //! tokio here only as the test driver.
 
 use futures::stream::StreamExt;
-use jsonrpc_rust_runtime::{Peer, RpcError, loopback};
+use peerline_runtime::{Peer, RpcError, loopback};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -45,8 +45,8 @@ async fn call_unknown_method_returns_method_not_found() {
 
     let err = a.call::<_, ()>("nope", &json!({})).await.unwrap_err();
     match err {
-        jsonrpc_rust_runtime::Error::Rpc(rpc_err) => {
-            assert_eq!(rpc_err.code, jsonrpc_rust::wire::ERR_METHOD_NOT_FOUND);
+        peerline_runtime::Error::Rpc(rpc_err) => {
+            assert_eq!(rpc_err.code, peerline::wire::ERR_METHOD_NOT_FOUND);
         }
         other => panic!("expected Rpc error, got {other:?}"),
     }
@@ -69,7 +69,7 @@ async fn call_handler_error_propagates() {
         .await
         .unwrap_err();
     match err {
-        jsonrpc_rust_runtime::Error::Rpc(rpc_err) => assert_eq!(rpc_err.code, -32000),
+        peerline_runtime::Error::Rpc(rpc_err) => assert_eq!(rpc_err.code, -32000),
         other => panic!("expected Rpc error, got {other:?}"),
     }
 }
@@ -158,7 +158,7 @@ async fn call_stream_yields_items_until_close() {
 
     let mut items: Vec<u32> = Vec::new();
     let mut seqs: Vec<u64> = Vec::new();
-    let mut stream: jsonrpc_rust_runtime::StreamReceiver<u32> =
+    let mut stream: peerline_runtime::StreamReceiver<u32> =
         a.call_stream("count", &CountQuery { n: 5 }).unwrap();
     while let Some(item) = stream.next().await {
         let item = item.unwrap();
@@ -179,7 +179,7 @@ async fn call_stream_propagates_handler_error() {
         sender.error(-32000, "kaboom").unwrap();
     });
 
-    let mut stream: jsonrpc_rust_runtime::StreamReceiver<String> =
+    let mut stream: peerline_runtime::StreamReceiver<String> =
         a.call_stream("boom", &json!([])).unwrap();
 
     // First yield: the item
@@ -190,7 +190,7 @@ async fn call_stream_propagates_handler_error() {
     // Second yield: the error
     let second = stream.next().await.unwrap();
     match second {
-        Err(jsonrpc_rust_runtime::Error::Rpc(e)) => {
+        Err(peerline_runtime::Error::Rpc(e)) => {
             assert_eq!(e.code, -32000);
             assert_eq!(e.message, "kaboom");
         }
@@ -221,7 +221,7 @@ async fn dropping_stream_receiver_sends_cancel_upstream() {
     });
 
     {
-        let _stream: jsonrpc_rust_runtime::StreamReceiver<String> =
+        let _stream: peerline_runtime::StreamReceiver<String> =
             a.call_stream("tail", &json!([])).unwrap();
         // Drop happens at end of scope — sends stream:cancel.
     }

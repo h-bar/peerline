@@ -1,5 +1,4 @@
-//! Streaming-extension tests (proposed JSON-RPC 2.1 — see
-//! `workbench/jsonrpc-rust-streaming.md`).
+//! Streaming-layer tests.
 //!
 //! `StreamFrame` is a phase-per-variant enum so the type system
 //! enforces the `data` ⇔ `Item` and `error` ⇔ `Error` invariants.
@@ -8,8 +7,8 @@
 //! deserialization edge cases (e.g. stray fields rejected by
 //! `deny_unknown_fields`).
 
-use jsonrpc_rust::peer::{self, InboundKind};
-use jsonrpc_rust::wire::{self, Frame, Id, StreamFrame};
+use peerline::peer::{self, InboundKind};
+use peerline::wire::{self, Frame, Id, StreamFrame};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------

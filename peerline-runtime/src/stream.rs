@@ -1,12 +1,12 @@
-//! Stream-side wrappers for the proposed 2.1 streaming extension.
+//! Stream-side wrappers for peerline's streaming layer.
 
 use crate::error::Error;
 use crate::peer::{PeerInner, send_frame};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::stream::Stream;
-use jsonrpc_rust::peer as p;
-use jsonrpc_rust::wire::{Frame, Id, StreamFrame};
+use peerline::peer as p;
+use peerline::wire::{Frame, Id, StreamFrame};
 use serde::{Serialize, de::DeserializeOwned};
 use std::marker::PhantomData;
 use std::pin::Pin;

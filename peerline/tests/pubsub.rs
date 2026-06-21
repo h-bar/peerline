@@ -1,8 +1,8 @@
 //! Extension tests for the pubsub-subscription module.
 
-use jsonrpc_rust::peer::{self, InboundKind};
-use jsonrpc_rust::pubsub::{self, PubsubMessage, SubscriptionIdGen};
-use jsonrpc_rust::wire::{Frame, Id, Notification, Params};
+use peerline::peer::{self, InboundKind};
+use peerline::pubsub::{self, PubsubMessage, SubscriptionIdGen};
+use peerline::wire::{Frame, Id, Notification, Params};
 use serde_json::json;
 
 #[test]

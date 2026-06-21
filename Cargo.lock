@@ -85,7 +85,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jsonrpc-rust"
+name = "memchr"
+version = "2.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+
+[[package]]
+name = "peerline"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -93,22 +99,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonrpc-rust-runtime"
+name = "peerline-runtime"
 version = "0.1.0"
 dependencies = [
  "futures",
- "jsonrpc-rust",
+ "peerline",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
 ]
-
-[[package]]
-name = "memchr"
-version = "2.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "pin-project-lite"

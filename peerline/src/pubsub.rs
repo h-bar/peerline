@@ -1,16 +1,16 @@
-//! JSON-RPC 2.0 pubsub-subscription extension — **not** in the spec.
+//! peerline pubsub layer — server-pushed event streams over
+//! notifications.
 //!
-//! De-facto convention used by Ethereum's `eth_subscribe`,
-//! jsonrpsee, and many other JSON-RPC frameworks. Layers cleanly on
-//! top of the spec-aligned [`crate::wire`] / [`crate::peer`] modules
-//! without modifying them.
+//! Layers cleanly on top of [`crate::wire`] / [`crate::peer`]
+//! without modifying them. The same wire convention is used by
+//! Ethereum's `eth_subscribe`, jsonrpsee, and many other ecosystems,
+//! so peerline endpoints stay interoperable with existing pubsub
+//! tooling.
 //!
-//! Under the peer-symmetric model, either peer can send a
-//! [`crate::wire::Notification`] — so server-pushed subscription
-//! events are just notifications on the `"event"` / `"end"` method
-//! names. No separate "event" wire type is needed; the type-system
-//! split between client-side and server-side notifications
-//! dissolves.
+//! Under peerline's peer-symmetric model, either peer can send a
+//! [`crate::wire::Notification`] — so subscription pushes are just
+//! notifications on the `"event"` / `"end"` method names. No
+//! separate "event" wire type is needed.
 //!
 //! ### Wire conventions
 //!

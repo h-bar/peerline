@@ -1,6 +1,6 @@
 [package]
-name = "jsonrpc-rust"
-description = "Transport-agnostic JSON-RPC 2.0 toolkit with the pubsub subscription extension"
+name = "peerline"
+description = "Peer-symmetric JSON framing toolkit — bidirectional request/response/notification/stream envelopes with a pubsub layer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

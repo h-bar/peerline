@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["jsonrpc-rust", "jsonrpc-rust-runtime"]
+members = ["peerline", "peerline-runtime"]
 
 [workspace.package]
 version = "0.1.0"
