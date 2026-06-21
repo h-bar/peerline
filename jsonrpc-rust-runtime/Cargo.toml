@@ -1,0 +1,23 @@
+[package]
+name = "jsonrpc-rust-runtime"
+description = "Stateful Peer on top of the jsonrpc-rust toolkit — call / notify / stream / handler registry. Runtime-agnostic, works on tokio, async-std, smol, and wasm."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jsonrpc-rust = { path = "../jsonrpc-rust" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# futures::channel (mpsc/oneshot) + FuturesUnordered let us run
+# handlers concurrently without needing a runtime's spawn primitive.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Dev-only: tokio gives us a runtime to drive `run_inbound` in
+# tests. The lib itself doesn't depend on any specific runtime.
+tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
