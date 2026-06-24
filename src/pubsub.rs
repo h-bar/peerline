@@ -2,15 +2,10 @@
 //! notifications.
 //!
 //! Layers cleanly on top of [`crate::wire`] / [`crate::peer`]
-//! without modifying them. The same wire convention is used by
-//! Ethereum's `eth_subscribe`, jsonrpsee, and many other ecosystems,
-//! so peerline endpoints stay interoperable with existing pubsub
-//! tooling.
-//!
-//! Under peerline's peer-symmetric model, either peer can send a
-//! [`crate::wire::Notification`] — so subscription pushes are just
-//! notifications on the `"event"` / `"end"` method names. No
-//! separate "event" wire type is needed.
+//! without modifying them. Under peerline's peer-symmetric model,
+//! either peer can send a [`Notification`] — so subscription pushes
+//! are just notifications on the `"event"` / `"end"` method names.
+//! No separate "event" wire type is needed.
 //!
 //! ### Wire conventions
 //!
@@ -26,25 +21,12 @@
 //! ### Client-side classification
 //!
 //! Pipe any [`InboundKind::IncomingNotification`](crate::peer::InboundKind::IncomingNotification)
-//! through [`classify`] to recognise pubsub messages:
-//!
-//! ```ignore
-//! match peer::classify(frame) {
-//!     InboundKind::IncomingNotification(notif) => {
-//!         match pubsub::classify(&notif) {
-//!             Some(PubsubMessage::Event { subscription_id, event }) => …,
-//!             Some(PubsubMessage::End { subscription_id }) => …,
-//!             None => log_unknown_notification(notif),
-//!         }
-//!     }
-//!     // …other InboundKind variants
-//! }
-//! ```
+//! through [`classify`] to recognise pubsub messages.
 
 use crate::peer;
-use crate::wire::{Id, JSONRPC_VERSION, Notification, Params, Request};
+use crate::wire::{Id, Notification, Params, Request};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -60,10 +42,7 @@ pub struct SubscriptionAck {
 }
 
 /// Params of an `event` notification: the subscription it belongs
-/// to plus one event payload. The event field is left as
-/// [`serde_json::Value`] so a single connection can multiplex
-/// subscriptions of different typed shapes; consumers deserialize
-/// the value into their domain type per subscription.
+/// to plus one event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventParams {
     /// Subscription this event belongs to.
@@ -73,16 +52,14 @@ pub struct EventParams {
 }
 
 /// Params of an `end` notification — sent once when a bounded
-/// subscription stream completes so the receiver can resolve its
-/// receiver / async iterator.
+/// subscription stream completes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndParams {
     /// Subscription that has ended.
     pub subscription_id: String,
 }
 
-/// Params of an `unsubscribe` request — the id of the subscription
-/// the caller wishes to cancel.
+/// Params of an `unsubscribe` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsubscribeParams {
     /// Subscription to cancel.
@@ -94,8 +71,7 @@ pub struct UnsubscribeParams {
 // ---------------------------------------------------------------------------
 
 /// Build a [`SubscriptionAck`] payload — the response body a
-/// subscribe handler returns. Wrap with
-/// [`crate::peer::response_ok`] to produce the actual response.
+/// subscribe handler returns.
 #[must_use]
 pub fn subscription_ack(subscription_id: impl Into<String>) -> SubscriptionAck {
     SubscriptionAck {
@@ -103,22 +79,19 @@ pub fn subscription_ack(subscription_id: impl Into<String>) -> SubscriptionAck {
     }
 }
 
-/// Build an `event` [`Notification`] for a subscription — wraps
-/// the caller's typed `payload` in an [`EventParams`] envelope
-/// under `method: "event"`. Errors only if the payload fails to
-/// serialize.
+/// Build an `event` [`Notification`] wrapping the caller's payload
+/// in an [`EventParams`] envelope.
 pub fn event<T: Serialize>(
     subscription_id: impl Into<String>,
     payload: &T,
 ) -> Result<Notification, serde_json::Error> {
-    let params_value = serde_json::to_value(EventParams {
+    let args = serde_json::to_value(EventParams {
         subscription_id: subscription_id.into(),
         event: serde_json::to_value(payload)?,
     })?;
     Ok(Notification {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        method: "event".to_string(),
-        params: params_from_value(params_value),
+        op: "event".to_string(),
+        args: params_from_value(args),
     })
 }
 
@@ -126,21 +99,17 @@ pub fn event<T: Serialize>(
 /// subscription stream.
 #[must_use]
 pub fn end(subscription_id: impl Into<String>) -> Notification {
-    let params_value = serde_json::to_value(EndParams {
+    let args = serde_json::to_value(EndParams {
         subscription_id: subscription_id.into(),
     })
     .unwrap_or(Value::Null);
     Notification {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        method: "end".to_string(),
-        params: params_from_value(params_value),
+        op: "end".to_string(),
+        args: params_from_value(args),
     }
 }
 
-/// Server-allocated subscription id generator. Each call to
-/// [`Self::next`] returns a fresh `sub-N` string. Backed by an
-/// [`AtomicU64`] so a single instance can be shared across
-/// concurrent subscribe handlers without external locking.
+/// Server-allocated subscription id generator.
 #[derive(Debug, Default)]
 pub struct SubscriptionIdGen {
     next: AtomicU64,
@@ -165,14 +134,9 @@ impl SubscriptionIdGen {
 // Client-side helpers (the receiving peer)
 // ---------------------------------------------------------------------------
 
-/// Build an `unsubscribe` request for the given subscription id —
-/// convenience wrapper around [`crate::peer::request`] with the
-/// standard `"unsubscribe"` method name and [`UnsubscribeParams`]
-/// body.
+/// Build an `unsubscribe` request for the given subscription id.
 #[must_use]
 pub fn unsubscribe_request(id: impl Into<Id>, subscription_id: impl Into<String>) -> Request {
-    // UnsubscribeParams always serializes to an object, so the
-    // params-shape check inside `request` never fires here.
     peer::request(
         id,
         "unsubscribe",
@@ -183,9 +147,7 @@ pub fn unsubscribe_request(id: impl Into<Id>, subscription_id: impl Into<String>
     .expect("UnsubscribeParams serializes to a JSON object")
 }
 
-/// A pubsub-method message, decoded by [`classify`]. `None` from
-/// `classify` means the notification's method isn't one this module
-/// recognises.
+/// A pubsub-method message, decoded by [`classify`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum PubsubMessage {
     /// One event on a live subscription (method = `"event"`).
@@ -205,22 +167,21 @@ pub enum PubsubMessage {
 }
 
 /// Recognise a [`Notification`] as a pubsub `event` or `end`
-/// message. Returns `Some(PubsubMessage)` if the method matches and
-/// the params deserialize cleanly; `None` otherwise — leaves the
-/// original notification untouched for the caller to handle (log,
-/// pass to another extension classifier, …).
+/// message. Returns `Some(PubsubMessage)` if the op matches and the
+/// args deserialize cleanly; `None` otherwise.
 pub fn classify(notif: &Notification) -> Option<PubsubMessage> {
-    let params_value = notif.params.as_ref()?.as_value();
-    match notif.method.as_str() {
+    let args_obj = notif.args.as_ref()?;
+    let args_value = Value::Object(args_obj.clone());
+    match notif.op.as_str() {
         "event" => {
-            let e: EventParams = serde_json::from_value(params_value).ok()?;
+            let e: EventParams = serde_json::from_value(args_value).ok()?;
             Some(PubsubMessage::Event {
                 subscription_id: e.subscription_id,
                 event: e.event,
             })
         }
         "end" => {
-            let e: EndParams = serde_json::from_value(params_value).ok()?;
+            let e: EndParams = serde_json::from_value(args_value).ok()?;
             Some(PubsubMessage::End {
                 subscription_id: e.subscription_id,
             })
@@ -233,13 +194,13 @@ pub fn classify(notif: &Notification) -> Option<PubsubMessage> {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Convert a `serde_json::Value` we just constructed (always an
-/// object for our envelopes) into the typed [`Params`] field
-/// expected by [`Notification`].
+/// Convert a [`serde_json::Value`] (always an object for our
+/// envelopes) into the typed [`Params`] field expected by
+/// [`Notification`].
 fn params_from_value(value: Value) -> Option<Params> {
     match value {
-        Value::Object(o) => Some(Params::Object(o)),
-        Value::Array(a) => Some(Params::Array(a)),
+        Value::Object(o) => Some(o),
+        Value::Null => Some(Map::new()),
         _ => None,
     }
 }

@@ -15,8 +15,7 @@ use super::stream::{StreamReceiver, StreamSender};
 use crate::peer as p;
 use crate::peer::{InboundKind, RequestIdGen};
 use crate::wire::{
-    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, Frame, Id, Notification, Params,
-    Request, Response, RpcError, StreamFrame,
+    ErrorType, Frame, Id, Notification, Params, Request, Response, RpcError, StreamFrame,
 };
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
@@ -205,18 +204,17 @@ impl Peer {
     // -----------------------------------------------------------------------
 
     /// Issue a request and await the typed response.
-    pub async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, Error>
+    pub async fn call<A, R>(&self, op: &str, args: &A) -> Result<R, Error>
     where
-        P: Serialize,
+        A: Serialize,
         R: DeserializeOwned,
     {
         let id = self.inner.ids.next_id();
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id.clone(), tx);
+        self.inner.pending.lock().unwrap().insert(id, tx);
 
-        let req =
-            p::request(id.clone(), method, params).map_err(|e| Error::Params(e.to_string()))?;
-        send_frame(&self.inner, Frame::Request(req))?;
+        let req = p::request(id, op, args).map_err(|e| Error::Params(e.to_string()))?;
+        send_frame(&self.inner, req)?;
 
         match rx.await {
             Ok(Ok(value)) => Ok(serde_json::from_value(value)?),
@@ -229,26 +227,25 @@ impl Peer {
     }
 
     /// Fire-and-forget one-way notification — no `id`, no reply.
-    pub fn notify<P: Serialize>(&self, method: &str, params: &P) -> Result<(), Error> {
-        let n = p::notification(method, params).map_err(|e| Error::Params(e.to_string()))?;
-        send_frame(&self.inner, Frame::Notification(n))
+    pub fn notify<A: Serialize>(&self, op: &str, args: &A) -> Result<(), Error> {
+        let n = p::notification(op, args).map_err(|e| Error::Params(e.to_string()))?;
+        send_frame(&self.inner, n)
     }
 
     /// Issue a streaming request. The returned [`StreamReceiver`]
     /// implements [`futures::Stream<Item = Result<R, Error>>`].
     /// Dropping the receiver sends a `stream:cancel` upstream.
-    pub fn call_stream<P, R>(&self, method: &str, params: &P) -> Result<StreamReceiver<R>, Error>
+    pub fn call_stream<A, R>(&self, op: &str, args: &A) -> Result<StreamReceiver<R>, Error>
     where
-        P: Serialize,
+        A: Serialize,
         R: DeserializeOwned + Unpin,
     {
         let id = self.inner.ids.next_id();
         let (tx, rx) = mpsc::unbounded();
-        self.inner.streams.lock().unwrap().insert(id.clone(), tx);
+        self.inner.streams.lock().unwrap().insert(id, tx);
 
-        let req =
-            p::request(id.clone(), method, params).map_err(|e| Error::Params(e.to_string()))?;
-        send_frame(&self.inner, Frame::Request(req))?;
+        let req = p::request(id, op, args).map_err(|e| Error::Params(e.to_string()))?;
+        send_frame(&self.inner, req)?;
 
         Ok(StreamReceiver::new(id, rx, self.inner.clone()))
     }
@@ -257,26 +254,26 @@ impl Peer {
     // Inbound: register handlers
     // -----------------------------------------------------------------------
 
-    /// Register a handler for incoming requests on `method`.
-    pub fn on_request<P, R, F, Fut>(&self, method: impl Into<String>, f: F)
+    /// Register a handler for incoming requests on `op`.
+    pub fn on_request<A, R, F, Fut>(&self, op: impl Into<String>, f: F)
     where
-        P: DeserializeOwned + Send + 'static,
+        A: DeserializeOwned + Send + 'static,
         R: Serialize + Send + 'static,
-        F: Fn(P) -> Fut + Send + Sync + 'static,
+        F: Fn(A) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<R, RpcError>> + Send + 'static,
     {
         let f = Arc::new(f);
-        let h: RequestHandler = Arc::new(move |params: serde_json::Value| {
+        let h: RequestHandler = Arc::new(move |args: serde_json::Value| {
             let f = f.clone();
             Box::pin(async move {
-                let p: P = serde_json::from_value(params).map_err(|e| RpcError {
-                    code: ERR_INVALID_PARAMS,
+                let a: A = serde_json::from_value(args).map_err(|e| RpcError {
+                    code: ErrorType::InvalidParams.into(),
                     message: e.to_string(),
                     data: None,
                 })?;
-                let r = f(p).await?;
+                let r = f(a).await?;
                 serde_json::to_value(r).map_err(|e| RpcError {
-                    code: ERR_INTERNAL,
+                    code: ErrorType::Internal.into(),
                     message: e.to_string(),
                     data: None,
                 })
@@ -286,60 +283,75 @@ impl Peer {
             .request_handlers
             .lock()
             .unwrap()
-            .insert(method.into(), h);
+            .insert(op.into(), h);
     }
 
-    /// Register a handler for incoming notifications on `method`.
+    /// Register a handler for incoming notifications on `op`.
     /// Notifications produce no reply; errors inside the handler
     /// are not surfaced over the wire.
-    pub fn on_notification<P, F, Fut>(&self, method: impl Into<String>, f: F)
+    pub fn on_notification<A, F, Fut>(&self, op: impl Into<String>, f: F)
     where
-        P: DeserializeOwned + Send + 'static,
-        F: Fn(P) -> Fut + Send + Sync + 'static,
+        A: DeserializeOwned + Send + 'static,
+        F: Fn(A) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let f = Arc::new(f);
-        let h: NotificationHandler = Arc::new(move |params: serde_json::Value| {
+        let h: NotificationHandler = Arc::new(move |args: serde_json::Value| {
             let f = f.clone();
             Box::pin(async move {
-                let Ok(p) = serde_json::from_value::<P>(params) else {
+                let Ok(a) = serde_json::from_value::<A>(args) else {
                     return;
                 };
-                f(p).await;
+                f(a).await;
             })
         });
         self.inner
             .notification_handlers
             .lock()
             .unwrap()
-            .insert(method.into(), h);
+            .insert(op.into(), h);
     }
 
-    /// Register a streaming-request handler for `method`. The
-    /// closure receives the deserialised params plus a
-    /// [`StreamSender`] for pushing items / closing / erroring.
-    pub fn on_stream_request<P, F, Fut>(&self, method: impl Into<String>, f: F)
+    /// Register a streaming-request handler for `op`. The closure
+    /// receives the deserialised args plus a [`StreamSender`] for
+    /// pushing items. The handler's return value drives the terminal
+    /// frame: `Ok(())` sends an empty terminal, `Err(rpc_err)` sends
+    /// an error terminal. A safety-net terminal is sent if the
+    /// handler future drops before returning.
+    pub fn on_stream_request<A, F, Fut>(&self, op: impl Into<String>, f: F)
     where
-        P: DeserializeOwned + Send + 'static,
-        F: Fn(P, StreamSender) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        A: DeserializeOwned + Send + 'static,
+        F: Fn(A, StreamSender) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), RpcError>> + Send + 'static,
     {
         let f = Arc::new(f);
-        let h: StreamHandler = Arc::new(move |params: serde_json::Value, sender: StreamSender| {
+        let h: StreamHandler = Arc::new(move |args: serde_json::Value, sender: StreamSender| {
             let f = f.clone();
+            let id = sender.id;
+            let inner = sender.state.clone();
             Box::pin(async move {
-                let Ok(p) = serde_json::from_value::<P>(params) else {
-                    let _ = sender.error(ERR_INVALID_PARAMS, "invalid params for stream request");
-                    return;
-                };
-                f(p, sender).await;
+                // Guard sends an empty terminal if the future drops
+                // (panic, executor cancel) before reaching the
+                // explicit terminal in the success / error branches.
+                let mut guard = super::stream::TerminalGuard::new(id, inner.clone());
+                match serde_json::from_value::<A>(args) {
+                    Ok(a) => match f(a, sender).await {
+                        Ok(()) => guard.send_normal(),
+                        Err(e) => guard.send_error(e),
+                    },
+                    Err(_) => guard.send_error(RpcError {
+                        code: ErrorType::InvalidParams.into(),
+                        message: "invalid args for stream request".into(),
+                        data: None,
+                    }),
+                }
             })
         });
         self.inner
             .stream_handlers
             .lock()
             .unwrap()
-            .insert(method.into(), h);
+            .insert(op.into(), h);
     }
 }
 
@@ -373,7 +385,7 @@ where
             // A handler finished — send its response back if it produced one
             done = handler_tasks.select_next_some() => {
                 if let Some(response) = done {
-                    let _ = send_frame(&inner, Frame::Response(response));
+                    let _ = send_frame(&inner, response);
                 }
             }
         }
@@ -382,7 +394,7 @@ where
     // Drain any still-running handlers so their responses get sent.
     while let Some(done) = handler_tasks.next().await {
         if let Some(response) = done {
-            let _ = send_frame(&inner, Frame::Response(response));
+            let _ = send_frame(&inner, response);
         }
     }
 
@@ -390,7 +402,7 @@ where
     let pending: Vec<_> = inner.pending.lock().unwrap().drain().collect();
     for (_id, tx) in pending {
         let _ = tx.send(Err(RpcError {
-            code: ERR_INTERNAL,
+            code: ErrorType::Internal.into(),
             message: "connection closed".into(),
             data: None,
         }));
@@ -406,7 +418,7 @@ fn on_inbound_text(
     let frame = match p::parse_frame(text) {
         Ok(f) => f,
         Err(parse_err_response) => {
-            let _ = send_frame(inner, Frame::Response(parse_err_response));
+            let _ = send_frame(inner, parse_err_response);
             return;
         }
     };
@@ -441,9 +453,6 @@ fn on_inbound_text(
                 let _ = tx.unbounded_send(sf);
             }
         }
-        // InboundKind is #[non_exhaustive]; forward-compat for
-        // any future variants the underlying crate may add.
-        _ => {}
     }
 }
 
@@ -470,8 +479,8 @@ impl Drop for InflightGuard {
 // ---------------------------------------------------------------------------
 
 async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response> {
-    let id = req.id.clone();
-    let params_value = params_into_value(req.params);
+    let id = req.id;
+    let args_value = args_into_value(req.args);
 
     // Try streaming handler first — if present, it gets a StreamSender
     // and produces no Response (the stream:* frames carry the reply).
@@ -479,11 +488,11 @@ async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response
         .stream_handlers
         .lock()
         .unwrap()
-        .get(&req.method)
+        .get(&req.op)
         .cloned();
     if let Some(handler) = stream_handler {
         let sender = StreamSender::new(id, inner.clone());
-        handler(params_value, sender).await;
+        handler(args_value, sender).await;
         return None;
     }
 
@@ -492,17 +501,17 @@ async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response
         .request_handlers
         .lock()
         .unwrap()
-        .get(&req.method)
+        .get(&req.op)
         .cloned();
     let response = match unary_handler {
-        Some(handler) => match handler(params_value).await {
+        Some(handler) => match handler(args_value).await {
             Ok(value) => p::response_ok_value(id, value),
             Err(rpc_err) => p::response_err(Some(id), rpc_err.code, rpc_err.message),
         },
         None => p::response_err(
             Some(id),
-            ERR_METHOD_NOT_FOUND,
-            format!("method not found: {}", req.method),
+            ErrorType::MethodNotFound,
+            format!("op not found: {}", req.op),
         ),
     };
     Some(response)
@@ -513,11 +522,11 @@ async fn process_notification(inner: Arc<PeerInner>, notif: Notification) {
         .notification_handlers
         .lock()
         .unwrap()
-        .get(&notif.method)
+        .get(&notif.op)
         .cloned();
     if let Some(handler) = handler {
-        let params_value = params_into_value(notif.params);
-        handler(params_value).await;
+        let args_value = args_into_value(notif.args);
+        handler(args_value).await;
     }
     // No reply for notifications, even if no handler is registered.
 }
@@ -531,8 +540,8 @@ async fn process_notification(inner: Arc<PeerInner>, notif: Notification) {
 /// queued frame; [`forward_outbound`] decrements after the wire
 /// write succeeds. On a closed-channel error the bump is
 /// rolled back so the counter stays accurate.
-pub(crate) fn send_frame(inner: &PeerInner, frame: Frame) -> Result<(), Error> {
-    let text = serde_json::to_string(&frame)?;
+pub(crate) fn send_frame<F: Into<Frame>>(inner: &PeerInner, frame: F) -> Result<(), Error> {
+    let text = serde_json::to_string(&frame.into())?;
     inner.outbound_depth.fetch_add(1, Ordering::AcqRel);
     inner.outbound.unbounded_send(text).map_err(|_| {
         inner.outbound_depth.fetch_sub(1, Ordering::AcqRel);
@@ -562,8 +571,7 @@ async fn forward_outbound<Si, SiE>(
     let _ = sink.close().await;
 }
 
-fn params_into_value(params: Option<Params>) -> serde_json::Value {
-    params
-        .map(|p| p.into_value())
+fn args_into_value(args: Option<Params>) -> serde_json::Value {
+    args.map(serde_json::Value::Object)
         .unwrap_or(serde_json::Value::Null)
 }

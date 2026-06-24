@@ -8,41 +8,27 @@
 //!
 //! ### What this module gives you
 //!
-//! - [`parse_frame`] — turn an inbound text frame into a [`Frame`].
-//!   Treats the protocol-version field as fully optional
-//!   (`Option<String>`) so peers like the codex app-server, which
-//!   omit it on the wire, decode cleanly. Callers who want strict
-//!   version enforcement can call [`wire::validate_version`] on
-//!   the parsed value themselves.
+//! - [`parse_frame`] — turn an inbound text frame into a [`Frame`]
+//!   in one serde call. Version dispatch (`v`) and kind dispatch
+//!   (`t`) happen inside the deserialize.
 //! - [`classify`] — turn a parsed [`Frame`] into [`InboundKind`]
-//!   for dispatch: this peer's pending Response, an incoming
-//!   Request the peer needs to handle, an incoming Notification,
-//!   or a Stream frame.
+//!   for routing: this peer's pending Response, an incoming Request
+//!   the peer needs to handle, an incoming Notification, or a
+//!   Stream frame.
 //! - Builders for outgoing frames: [`request`], [`notification`],
 //!   [`response_ok`], [`response_err`], plus value/with_data
-//!   variants for direct-`Value` and `data`-carrying paths.
+//!   variants and stream phase builders.
 //! - [`RequestIdGen`] — local-unique id allocator for *this* peer's
-//!   outgoing requests. Each peer numbers from 1 independently; the
-//!   correlation between request and reply is "the id I just gave
-//!   out matches the id on the inbound Response."
+//!   outgoing requests.
 //!
 //! All helpers are pure: no IO, no locks, no async. The
-//! state-holding `Peer` *struct* (pending-requests map, handler
-//! registry, mutex strategy, async runtime) is intentionally NOT
-//! in this crate — that's runtime-dependent. Build it in your
-//! transport layer with whatever async primitives you prefer (or
-//! use [`peerline_runtime`](https://docs.rs/peerline-runtime)).
-//!
-//! **Batching is intentionally not handled here.** Packing multiple
-//! frames into one wire message is a transport-layer concern.
-//! Transports that support it split the wire array into individual
-//! frame strings and call [`parse_frame`] on each, collecting
-//! [`Response`]s into a reply array if needed.
+//! state-holding `Peer` struct (pending-requests map, handler
+//! registry, async runtime) lives in [`crate::runtime`].
 //!
 //! ### Data flow
 //!
 //! ```text
-//! text frame ──► parse_frame ──► Frame
+//! text frame ──► parse_frame ──► Frame::V1(Content::*)
 //!                                  │
 //!                                  ▼
 //!                              classify
@@ -53,24 +39,10 @@
 //!  (resolve pending)       (dispatch handler, build      (dispatch handler,
 //!                           Response, send it back)       no reply)
 //! ```
-//!
-//! ### Example dispatch (the same shape on both ends)
-//!
-//! ```ignore
-//! let frame = peer::parse_frame(&text)?;
-//! match peer::classify(frame) {
-//!     InboundKind::Response { id, outcome } => resolve_pending(id, outcome),
-//!     InboundKind::IncomingRequest(req) => {
-//!         let resp = my_handler(req).await;
-//!         send(&serde_json::to_string(&resp)?).await;
-//!     }
-//!     InboundKind::IncomingNotification(n) => my_notif_handler(n).await,
-//! }
-//! ```
 
 use crate::wire::{
-    ERR_INVALID_REQUEST, ERR_PARSE, Frame, Id, JSONRPC_VERSION, Notification, Request, Response,
-    ResponseErr, ResponseOk, RpcError, StreamFrame,
+    Content, ErrorType, Frame, Id, Notification, Params, Request, Response, ResponseErr,
+    ResponseOk, RpcError, STREAM_TERMINAL_SEQ, StreamFrame,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -83,10 +55,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// What an inbound [`Frame`] resolves to from this peer's
 /// perspective. The transport's read loop calls [`classify`] on
 /// each parsed frame and dispatches based on the variant.
-///
-/// Pubsub-aware peers pipe [`InboundKind::IncomingNotification`]
-/// through [`crate::pubsub::classify`] to recognise subscription
-/// pushes; the core layer doesn't bake in that convention.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum InboundKind {
@@ -94,9 +62,7 @@ pub enum InboundKind {
     Response {
         /// The request id this response matches. `None` ⇒ wire
         /// carried JSON `null` (a parse-error reply for which the
-        /// responder couldn't recover the id); the consumer
-        /// typically can't match this to any pending caller and
-        /// should log it.
+        /// responder couldn't recover the id).
         id: Option<Id>,
         /// `Ok(result)` on success, `Err(rpc_error)` on failure.
         outcome: Result<Value, RpcError>,
@@ -107,10 +73,8 @@ pub enum InboundKind {
     /// A notification initiated by the other peer — handle it
     /// silently, no reply.
     IncomingNotification(Notification),
-    /// A streaming-lifecycle frame (see [`StreamFrame`]). Route by
-    /// `frame.id` to the matching stream in this peer's stream
-    /// registry, then act on `frame.stream`
-    /// (open / item / close / error / cancel).
+    /// A streaming-lifecycle frame. Route by `frame.id()` to the
+    /// matching stream in this peer's stream registry.
     Stream(StreamFrame),
 }
 
@@ -118,16 +82,18 @@ pub enum InboundKind {
 #[must_use]
 pub fn classify(frame: Frame) -> InboundKind {
     match frame {
-        Frame::Response(r) => {
-            let id = r.id().cloned();
-            InboundKind::Response {
-                id,
-                outcome: r.into_outcome(),
+        Frame::V1(content) => match content {
+            Content::Response(r) => {
+                let id = r.id().copied();
+                InboundKind::Response {
+                    id,
+                    outcome: r.into_outcome(),
+                }
             }
-        }
-        Frame::Request(r) => InboundKind::IncomingRequest(r),
-        Frame::Notification(n) => InboundKind::IncomingNotification(n),
-        Frame::Stream(s) => InboundKind::Stream(s),
+            Content::Request(r) => InboundKind::IncomingRequest(r),
+            Content::Notification(n) => InboundKind::IncomingNotification(n),
+            Content::Stream(s) => InboundKind::Stream(s),
+        },
     }
 }
 
@@ -137,113 +103,84 @@ pub fn classify(frame: Frame) -> InboundKind {
 
 /// Parse one inbound text frame.
 ///
-/// The protocol-version field is **fully optional** — peers that
-/// omit it (codex app-server, some MCP transports) decode with the
-/// `jsonrpc` field as `None`. Callers who want strict version
-/// enforcement can still call [`crate::wire::validate_version`] on
-/// the returned frame when the field is `Some`.
-///
 /// Returns:
-/// - `Ok(Frame::Request | Notification | Response | Stream)` for a
-///   single well-formed JSON object.
-/// - `Err(response)` for invalid JSON, or a shape that doesn't match
-///   any `Frame` variant (e.g. an array — batching is a transport
-///   concern, see below). The returned [`Response`] is the
-///   ready-to-serialize reply with `id: null`.
+/// - `Ok(Frame)` for a single well-formed JSON frame.
+/// - `Err(response)` for invalid JSON or any shape that doesn't
+///   match an expected variant (wrong `v`, unknown `t`, missing
+///   required field, etc.). The returned [`Response`] is the
+///   ready-to-serialize error reply with `id: null`.
 ///
 /// **Batching**: this parser handles one frame at a time. Transports
 /// that pack multiple frames into one wire message split the array
 /// into individual frame strings and call this once per element.
 //
 // `Response` is ~144 B (above clippy's 128 B `result_large_err`
-// threshold), but the error path is one-shot — the caller serializes
+// threshold), but the error path is one-shot — caller serializes
 // and sends immediately, so boxing here would just add an allocation.
 #[allow(clippy::result_large_err)]
 pub fn parse_frame(text: &str) -> Result<Frame, Response> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|e| response_err(None, ERR_PARSE, format!("parse error: {e}")))?;
-    let normalized = normalize_null_id(value);
-    let frame: Frame = serde_json::from_value(normalized)
-        .map_err(|e| response_err(None, ERR_INVALID_REQUEST, format!("invalid frame: {e}")))?;
-    Ok(frame)
-}
-
-/// Strip an `id: null` field off an inbound object so the entry is
-/// dispatched as a [`Notification`] (no `id`) rather than failing
-/// [`Request`] deserialization (which requires non-null `id`).
-/// peerline treats a null id identically to a missing one.
-fn normalize_null_id(value: Value) -> Value {
-    if let Value::Object(mut obj) = value {
-        if matches!(obj.get("id"), Some(Value::Null)) {
-            obj.remove("id");
-        }
-        Value::Object(obj)
-    } else {
-        value
-    }
+    serde_json::from_str(text)
+        .map_err(|e| response_err(None, ErrorType::InvalidRequest, format!("invalid frame: {e}")))
 }
 
 // ---------------------------------------------------------------------------
 // Outgoing builders — request side
 // ---------------------------------------------------------------------------
 
-/// Build a [`Request`] for `method` with `params`, tagged with the
-/// caller-allocated `id` (any [`Id`] variant). Errors only if
-/// `params` fails to serialize. `params` must serialize to a JSON
-/// Array or Object; scalars / booleans / `null` are rejected.
+/// Build a [`Request`] for `op` with `args`. Errors only if `args`
+/// fails to serialize or doesn't serialize to a JSON Object.
 pub fn request<T: Serialize>(
     id: impl Into<Id>,
-    method: impl Into<String>,
-    params: &T,
+    op: impl Into<String>,
+    args: &T,
 ) -> Result<Request, serde_json::Error> {
-    let value = serde_json::to_value(params)?;
+    let value = serde_json::to_value(args)?;
     let typed = params_from_value(value).ok_or_else(|| {
-        serde::ser::Error::custom("params must serialize to a JSON Array or Object")
+        <serde_json::Error as serde::ser::Error>::custom(
+            "args must serialize to a JSON Object",
+        )
     })?;
     Ok(Request {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id: id.into(),
-        method: method.into(),
-        params: Some(typed),
+        op: op.into(),
+        args: Some(typed),
     })
 }
 
-/// Build a parameter-less [`Request`] for `method`.
+/// Build an argument-less [`Request`] for `op`.
 #[must_use]
-pub fn request_no_params(id: impl Into<Id>, method: impl Into<String>) -> Request {
+pub fn request_no_args(id: impl Into<Id>, op: impl Into<String>) -> Request {
     Request {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id: id.into(),
-        method: method.into(),
-        params: None,
+        op: op.into(),
+        args: None,
     }
 }
 
-/// Build a [`Notification`] — a one-way call with no `id` and no
-/// response expected. `params` must serialize to a JSON Array or
-/// Object.
+/// Build a [`Notification`]. Errors only if `args` fails to
+/// serialize or doesn't serialize to a JSON Object.
 pub fn notification<T: Serialize>(
-    method: impl Into<String>,
-    params: &T,
+    op: impl Into<String>,
+    args: &T,
 ) -> Result<Notification, serde_json::Error> {
-    let value = serde_json::to_value(params)?;
+    let value = serde_json::to_value(args)?;
     let typed = params_from_value(value).ok_or_else(|| {
-        serde::ser::Error::custom("params must serialize to a JSON Array or Object")
+        <serde_json::Error as serde::ser::Error>::custom(
+            "args must serialize to a JSON Object",
+        )
     })?;
     Ok(Notification {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        method: method.into(),
-        params: Some(typed),
+        op: op.into(),
+        args: Some(typed),
     })
 }
 
-/// Build a parameter-less [`Notification`] for `method`.
+/// Build an argument-less [`Notification`] for `op`.
 #[must_use]
-pub fn notification_no_params(method: impl Into<String>) -> Notification {
+pub fn notification_no_args(op: impl Into<String>) -> Notification {
     Notification {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        method: method.into(),
-        params: None,
+        op: op.into(),
+        args: None,
     }
 }
 
@@ -251,63 +188,55 @@ pub fn notification_no_params(method: impl Into<String>) -> Notification {
 // Outgoing builders — response side
 // ---------------------------------------------------------------------------
 
-/// Build a success [`Response`] with the given `id` and serialized
-/// `result`. Errors only if `result` fails to serialize. `id` is
-/// non-optional — a successful response always knows the request's
-/// id. For the parse-error null-id case, use [`response_err`] /
-/// [`response_err_with_data`] with `None`.
+/// Build a success [`Response`] with `result`.
 pub fn response_ok<T: Serialize>(
     id: impl Into<Id>,
     result: &T,
 ) -> Result<Response, serde_json::Error> {
     Ok(Response::Ok(ResponseOk {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id: id.into(),
         result: serde_json::to_value(result)?,
     }))
 }
 
 /// Build a success [`Response`] whose `result` is already a
-/// `serde_json::Value`. Cannot fail, unlike [`response_ok`].
+/// [`serde_json::Value`].
 #[must_use]
 pub fn response_ok_value(id: impl Into<Id>, result: Value) -> Response {
     Response::Ok(ResponseOk {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id: id.into(),
         result,
     })
 }
 
-/// Build an error [`Response`] with the given `id`, error `code`,
-/// and human-readable `message`. Pass `None` for `id` on
-/// parse-error / invalid-request replies where the responder
-/// couldn't recover the original id (the wire field becomes JSON
-/// `null`).
-pub fn response_err(id: Option<Id>, code: i32, message: impl Into<String>) -> Response {
+/// Build an error [`Response`]. Pass `None` for `id` on parse-error
+/// replies where the responder couldn't recover the original id.
+pub fn response_err(
+    id: Option<Id>,
+    code: impl Into<i32>,
+    message: impl Into<String>,
+) -> Response {
     Response::Err(ResponseErr {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
         error: RpcError {
-            code,
+            code: code.into(),
             message: message.into(),
             data: None,
         },
     })
 }
 
-/// Build an error [`Response`] including the optional `data`
-/// payload on the inner [`RpcError`].
+/// Build an error [`Response`] with an attached `data` payload.
 pub fn response_err_with_data(
     id: Option<Id>,
-    code: i32,
+    code: impl Into<i32>,
     message: impl Into<String>,
     data: Value,
 ) -> Response {
     Response::Err(ResponseErr {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
         error: RpcError {
-            code,
+            code: code.into(),
             message: message.into(),
             data: Some(data),
         },
@@ -320,9 +249,7 @@ pub fn response_err_with_data(
 
 /// Allocator for **this peer's** outgoing request ids. Each peer
 /// maintains its own; correlation is "the id I issued" matches "the
-/// id on the reply I receive." Backed by an [`AtomicU64`] so a
-/// single instance can be shared across concurrent callers without
-/// external locking.
+/// id on the reply I receive."
 #[derive(Debug)]
 pub struct RequestIdGen {
     next: AtomicU64,
@@ -335,8 +262,8 @@ impl Default for RequestIdGen {
 }
 
 impl RequestIdGen {
-    /// Fresh generator starting at id `1` (id `0` is reserved so
-    /// `0` can be used as a sentinel in registry maps if desired).
+    /// Fresh generator starting at id `1` (id `0` reserved as a
+    /// sentinel for registry maps).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -344,109 +271,105 @@ impl RequestIdGen {
         }
     }
 
-    /// Allocate the next raw `u64`. Use [`Self::next_id`] to get a
-    /// typed [`Id`] directly.
+    /// Allocate the next raw `u64`. Equivalent to [`Self::next_id`]
+    /// since [`Id`] is `u64`; kept for source compatibility.
     #[must_use]
     pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Allocate the next id as a typed [`Id::Number`].
+    /// Allocate the next id.
     #[must_use]
     pub fn next_id(&self) -> Id {
-        Id::Number(self.next() as i64)
+        self.next()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Streaming
-//
-// Builders for [`StreamFrame`] frames keyed by request id. Each peer
-// holds its own per-stream state (item channels, half-close flags,
-// cancel watchers) outside this library — these helpers only build
-// the wire frames.
+// Streaming builders
 // ---------------------------------------------------------------------------
 
-/// Build a `stream:open` frame — optional ack of streaming intent.
-#[must_use]
-pub fn stream_open(id: impl Into<Id>) -> StreamFrame {
-    StreamFrame::Open {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        id: id.into(),
-    }
-}
-
-/// Build a `stream:item` frame carrying one element of the sender's
-/// outgoing stream. `seq` is the producer-assigned monotonic
-/// sequence number (starts at `1` for the first item). Errors only
-/// if `data` fails to serialize.
+/// Build a stream item frame (non-terminal). `seq` is the
+/// producer-assigned monotonic sequence number, starting at `1`.
+/// Non-consecutive `seq`s between items signal drops the producer
+/// advanced past (see [`crate::runtime::StreamSender::skip`]).
 pub fn stream_item<T: Serialize>(
     id: impl Into<Id>,
     seq: u64,
     data: &T,
 ) -> Result<StreamFrame, serde_json::Error> {
-    Ok(StreamFrame::Item {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
+    Ok(StreamFrame {
         id: id.into(),
-        seq,
-        data: serde_json::to_value(data)?,
+        seq: seq as i64,
+        data: Some(serde_json::to_value(data)?),
+        error: None,
     })
 }
 
-/// Build a `stream:close` frame — graceful half-close, the sender
-/// will produce no more items. The other side may still send;
-/// stream is `DONE` only when both halves are closed.
+/// Build a terminal frame (`seq = -1`) with no payload — normal
+/// end-of-stream.
 #[must_use]
-pub fn stream_close(id: impl Into<Id>) -> StreamFrame {
-    StreamFrame::Close {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
+pub fn stream_terminal(id: impl Into<Id>) -> StreamFrame {
+    StreamFrame {
         id: id.into(),
+        seq: STREAM_TERMINAL_SEQ,
+        data: None,
+        error: None,
     }
 }
 
-/// Build a `stream:error` frame — abnormal half-close, the sender
-/// failed on its side.
-#[must_use]
-pub fn stream_error(id: impl Into<Id>, code: i32, message: impl Into<String>) -> StreamFrame {
-    StreamFrame::Error {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
+/// Build a terminal frame carrying the last item. Equivalent to
+/// emitting one final item and the end-of-stream marker in a single
+/// frame.
+pub fn stream_terminal_with_data<T: Serialize>(
+    id: impl Into<Id>,
+    data: &T,
+) -> Result<StreamFrame, serde_json::Error> {
+    Ok(StreamFrame {
         id: id.into(),
-        error: RpcError {
-            code,
+        seq: STREAM_TERMINAL_SEQ,
+        data: Some(serde_json::to_value(data)?),
+        error: None,
+    })
+}
+
+/// Build a terminal frame carrying an error — stream ended abnormally.
+#[must_use]
+pub fn stream_terminal_with_error(
+    id: impl Into<Id>,
+    code: impl Into<i32>,
+    message: impl Into<String>,
+) -> StreamFrame {
+    StreamFrame {
+        id: id.into(),
+        seq: STREAM_TERMINAL_SEQ,
+        data: None,
+        error: Some(RpcError {
+            code: code.into(),
             message: message.into(),
             data: None,
-        },
+        }),
     }
 }
 
-/// Build a `stream:error` frame including the optional `data`
+/// Build a terminal frame carrying an error with an attached `data`
 /// payload on the inner [`RpcError`].
 #[must_use]
-pub fn stream_error_with_data(
+pub fn stream_terminal_with_error_data(
     id: impl Into<Id>,
-    code: i32,
+    code: impl Into<i32>,
     message: impl Into<String>,
     data: Value,
 ) -> StreamFrame {
-    StreamFrame::Error {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
+    StreamFrame {
         id: id.into(),
-        error: RpcError {
-            code,
+        seq: STREAM_TERMINAL_SEQ,
+        data: None,
+        error: Some(RpcError {
+            code: code.into(),
             message: message.into(),
             data: Some(data),
-        },
-    }
-}
-
-/// Build a `stream:cancel` frame — full-close, terminates the
-/// stream in both directions immediately and discards anything
-/// in-flight. Either peer may send.
-#[must_use]
-pub fn stream_cancel(id: impl Into<Id>) -> StreamFrame {
-    StreamFrame::Cancel {
-        jsonrpc: Some(JSONRPC_VERSION.to_string()),
-        id: id.into(),
+        }),
     }
 }
 
@@ -454,14 +377,12 @@ pub fn stream_cancel(id: impl Into<Id>) -> StreamFrame {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Convert a `serde_json::Value` into the typed
-/// [`crate::wire::Params`] expected by [`Request`] / [`Notification`].
-/// Returns `None` for scalars / booleans / `null`, which are
-/// rejected by peerline's params typing.
-fn params_from_value(value: Value) -> Option<crate::wire::Params> {
+/// Convert a [`serde_json::Value`] into the typed [`Params`] expected
+/// by [`Request`] / [`Notification`]. Returns `None` for anything
+/// that isn't a JSON Object.
+fn params_from_value(value: Value) -> Option<Params> {
     match value {
-        Value::Object(o) => Some(crate::wire::Params::Object(o)),
-        Value::Array(a) => Some(crate::wire::Params::Array(a)),
+        Value::Object(o) => Some(o),
         _ => None,
     }
 }

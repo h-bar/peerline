@@ -1,7 +1,7 @@
 [package]
 name = "peerline"
-description = "Peer-symmetric JSON framing toolkit — bidirectional request/response/notification/stream envelopes with a pubsub layer, plus an optional stateful Peer runtime"
-version = "0.0.1"
+description = "Peer-symmetric bidirectional RPC toolkit — typed request/response/notification/stream envelopes with a pubsub layer, version-tagged JSON wire format, plus an optional stateful Peer runtime"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 

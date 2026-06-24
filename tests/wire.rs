@@ -2,116 +2,103 @@
 
 use peerline::peer::{self, InboundKind};
 use peerline::wire::{
-    self, ERR_INVALID_REQUEST, ERR_PARSE, Frame, Id, Params, Request, Response, ResponseErr,
-    RpcError,
+    Content, ErrorType, Frame, Response, ResponseErr, RpcError,
 };
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
-// Id — Number | String, no fractional, no null (null lives in Option<Id>)
+// Frame round-trip — outer ver tag + inner kind tag + short field names
 // ---------------------------------------------------------------------------
 
 #[test]
-fn id_deserializes_number_and_string() {
-    let n: Id = serde_json::from_str("42").unwrap();
-    assert_eq!(n, Id::Number(42));
-    let s: Id = serde_json::from_str("\"abc\"").unwrap();
-    assert_eq!(s, Id::String("abc".into()));
+fn request_frame_round_trip() {
+    let req = peer::request(7u64, "add", &json!({"a": 1, "b": 2})).unwrap();
+    let frame: Frame = req.into();
+    let s = serde_json::to_string(&frame).unwrap();
+    assert!(s.contains("\"ver\":\"1\""), "expected ver:\"1\": {s}");
+    assert!(s.contains("\"kind\":\"req\""), "expected kind:\"req\": {s}");
+    assert!(s.contains("\"op\":\"add\""), "expected op:\"add\": {s}");
+    assert!(s.contains("\"args\""), "expected args field: {s}");
+    let back: Frame = serde_json::from_str(&s).unwrap();
+    assert!(matches!(back, Frame::V1(Content::Request(_))));
 }
 
 #[test]
-fn id_rejects_fractional_number() {
-    assert!(serde_json::from_str::<Id>("3.14").is_err());
+fn response_ok_frame_round_trip() {
+    let resp = peer::response_ok_value(1u64, json!(42));
+    let frame: Frame = resp.into();
+    let s = serde_json::to_string(&frame).unwrap();
+    assert!(s.contains("\"ver\":\"1\""));
+    assert!(s.contains("\"kind\":\"resp\""));
+    assert!(s.contains("\"data\":42"));
+    assert!(!s.contains("\"err\":"), "ok shouldn't carry err: {s}");
 }
 
 #[test]
-fn id_rejects_null_and_bool() {
-    assert!(serde_json::from_str::<Id>("null").is_err());
-    assert!(serde_json::from_str::<Id>("true").is_err());
+fn response_err_frame_round_trip() {
+    let resp = peer::response_err(Some(1u64), -32000, "boom");
+    let frame: Frame = resp.into();
+    let s = serde_json::to_string(&frame).unwrap();
+    assert!(s.contains("\"ver\":\"1\""));
+    assert!(s.contains("\"kind\":\"resp\""));
+    assert!(s.contains("\"err\""));
+    assert!(!s.contains("\"data\":"), "err shouldn't carry data: {s}");
 }
 
 #[test]
-fn id_round_trips() {
-    for value in [Id::Number(7), Id::String("k".into())] {
-        let s = serde_json::to_string(&value).unwrap();
-        let back: Id = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, value);
-    }
+fn notification_frame_round_trip() {
+    let n = peer::notification("ping", &json!({"x": 1})).unwrap();
+    let frame: Frame = n.into();
+    let s = serde_json::to_string(&frame).unwrap();
+    assert!(s.contains("\"ver\":\"1\""));
+    assert!(s.contains("\"kind\":\"notif\""));
+    assert!(s.contains("\"op\":\"ping\""));
+    assert!(!s.contains("\"id\""), "notification must not carry id: {s}");
 }
+
+// ---------------------------------------------------------------------------
+// Response shape — Ok | Err mutual exclusion
+// ---------------------------------------------------------------------------
 
 #[test]
 fn err_response_serializes_none_id_as_null() {
-    // Only the Err variant carries Option<Id>; the parse-error case
-    // (id: None) must wire as JSON null.
-    let r = Response::Err(ResponseErr {
-        jsonrpc: Some("2.0".into()),
+    let r: Response = Response::Err(ResponseErr {
         id: None,
         error: RpcError {
-            code: ERR_PARSE,
+            code: -32700,
             message: "boom".into(),
             data: None,
         },
     });
-    let s = serde_json::to_string(&r).unwrap();
+    let frame: Frame = r.into();
+    let s = serde_json::to_string(&frame).unwrap();
     assert!(s.contains("\"id\":null"), "expected id:null, got: {s}");
 }
 
-// ---------------------------------------------------------------------------
-// Params — Array | Object only
-// ---------------------------------------------------------------------------
-
-#[test]
-fn params_accepts_array_and_object_only() {
-    assert!(matches!(
-        serde_json::from_str::<Params>("[1, 2]").unwrap(),
-        Params::Array(_)
-    ));
-    assert!(matches!(
-        serde_json::from_str::<Params>(r#"{"x": 1}"#).unwrap(),
-        Params::Object(_)
-    ));
-    assert!(serde_json::from_str::<Params>("42").is_err());
-    assert!(serde_json::from_str::<Params>("\"s\"").is_err());
-    assert!(serde_json::from_str::<Params>("true").is_err());
-    assert!(serde_json::from_str::<Params>("null").is_err());
-}
-
-// ---------------------------------------------------------------------------
-// Request — id required + non-null
-// ---------------------------------------------------------------------------
-
-#[test]
-fn request_requires_non_null_id() {
-    assert!(serde_json::from_str::<Request>(r#"{"jsonrpc":"2.0","method":"ping"}"#).is_err());
-    assert!(
-        serde_json::from_str::<Request>(r#"{"jsonrpc":"2.0","method":"ping","id":null}"#).is_err()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Response — Ok | Err mutual exclusion at the type level
-// ---------------------------------------------------------------------------
-
 #[test]
 fn response_rejects_both_result_and_error() {
-    let frame = r#"{"jsonrpc":"2.0","id":1,"result":"v","error":{"code":-32603,"message":"bad"}}"#;
-    assert!(serde_json::from_str::<Response>(frame).is_err());
+    // Response::Ok has deny_unknown_fields (rejects `e`); Response::Err
+    // has deny_unknown_fields (rejects `r`); the untagged enum tries
+    // both and fails.
+    let bad = r#"{"ver":"1","kind":"resp","id":1,"data":"v","err":{"code":-1,"msg":"x"}}"#;
+    assert!(serde_json::from_str::<Frame>(bad).is_err());
 }
 
 #[test]
 fn response_rejects_neither_result_nor_error() {
-    assert!(serde_json::from_str::<Response>(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
+    let bad = r#"{"ver":"1","kind":"resp","id":1}"#;
+    assert!(serde_json::from_str::<Frame>(bad).is_err());
 }
 
 #[test]
 fn response_accessors_match_variant() {
-    let ok = peer::response_ok_value(Id::Number(1), json!("ok"));
+    let ok = peer::response_ok_value(1u64, json!("ok"));
     assert!(ok.is_ok());
     assert_eq!(ok.result(), Some(&json!("ok")));
     assert_eq!(ok.error(), None);
-    assert_eq!(ok.id(), Some(&Id::Number(1)));
+    assert_eq!(ok.id(), Some(&1u64));
 
-    let err = peer::response_err(Some(Id::Number(2)), -32000, "boom");
+    let err = peer::response_err(Some(2u64), -32000, "boom");
     assert!(err.is_err());
     let e = err.error().expect("error variant");
     assert_eq!(e.code, -32000);
@@ -121,30 +108,13 @@ fn response_accessors_match_variant() {
 #[test]
 fn response_into_outcome_collapses_to_result() {
     assert_eq!(
-        peer::response_ok_value(Id::Number(1), json!(42)).into_outcome(),
+        peer::response_ok_value(1u64, json!(42)).into_outcome(),
         Ok(json!(42))
     );
-    match peer::response_err(Some(Id::Number(2)), -32000, "nope").into_outcome() {
+    match peer::response_err(Some(2u64), -32000, "nope").into_outcome() {
         Err(e) => assert_eq!(e.code, -32000),
         Ok(_) => panic!("expected Err"),
     }
-}
-
-#[test]
-fn response_serializes_without_null_result_and_error() {
-    let ok = peer::response_ok_value(Id::Number(1), json!("v"));
-    let s = serde_json::to_string(&ok).unwrap();
-    assert!(
-        !s.contains("\"error\""),
-        "ok response shouldn't carry error: {s}"
-    );
-
-    let err = peer::response_err(Some(Id::Number(1)), -32603, "bad");
-    let s = serde_json::to_string(&err).unwrap();
-    assert!(
-        !s.contains("\"result\""),
-        "err response shouldn't carry result: {s}"
-    );
 }
 
 #[test]
@@ -160,92 +130,71 @@ fn rpc_error_data_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// parse_frame — single frame classification
+// parse_frame — single-frame classification
 // ---------------------------------------------------------------------------
 
 #[test]
 fn parse_frame_classifies_request() {
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping","id":1}"#).unwrap();
-    assert!(matches!(frame, Frame::Request(_)));
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"req","op":"ping","id":1}"#).unwrap();
+    assert!(matches!(frame, Frame::V1(Content::Request(_))));
 }
 
 #[test]
 fn parse_frame_classifies_notification() {
-    // No id field → Notification
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping"}"#).unwrap();
-    assert!(matches!(frame, Frame::Notification(_)));
-}
-
-#[test]
-fn parse_frame_treats_null_id_as_notification() {
-    // peerline normalizes id:null to no-id (Notification) before
-    // deserialize, so requests with an explicit null id classify as
-    // notifications rather than failing.
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping","id":null}"#).unwrap();
-    assert!(matches!(frame, Frame::Notification(_)));
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"notif","op":"ping"}"#).unwrap();
+    assert!(matches!(frame, Frame::V1(Content::Notification(_))));
 }
 
 #[test]
 fn parse_frame_classifies_response_ok() {
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","id":1,"result":"v"}"#).unwrap();
-    assert!(matches!(frame, Frame::Response(Response::Ok(_))));
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"data":"v"}"#).unwrap();
+    assert!(matches!(
+        frame,
+        Frame::V1(Content::Response(Response::Ok(_)))
+    ));
 }
 
 #[test]
 fn parse_frame_classifies_response_err() {
     let frame =
-        peer::parse_frame(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#).unwrap();
-    assert!(matches!(frame, Frame::Response(Response::Err(_))));
+        peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"err":{"code":-1,"msg":"x"}}"#).unwrap();
+    assert!(matches!(
+        frame,
+        Frame::V1(Content::Response(Response::Err(_)))
+    ));
 }
 
 #[test]
-fn parse_frame_returns_parse_error_for_invalid_json() {
+fn parse_frame_returns_invalid_request_for_invalid_json() {
     let resp = peer::parse_frame("not json").unwrap_err();
-    assert_eq!(resp.error().unwrap().code, ERR_PARSE);
+    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
     assert_eq!(resp.id(), None);
 }
 
-// ---------------------------------------------------------------------------
-// parse_frame — `jsonrpc` version is optional + always accepted
-// ---------------------------------------------------------------------------
-
 #[test]
-fn parse_frame_accepts_bad_version() {
-    // Wrong jsonrpc version still parses successfully — callers who
-    // care about spec strictness validate the value themselves.
-    let frame = peer::parse_frame(r#"{"jsonrpc":"1.0","method":"a","id":1}"#).unwrap();
-    assert!(matches!(frame, Frame::Request(_)));
+fn parse_frame_rejects_unknown_version() {
+    let resp = peer::parse_frame(r#"{"ver":"999","kind":"req","op":"foo","id":1}"#).unwrap_err();
+    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
 }
 
 #[test]
-fn parse_frame_accepts_missing_version() {
-    // Codex app-server and similar peers omit the `jsonrpc` field on
-    // the wire entirely. The parser leaves the field as `None`.
-    let frame = peer::parse_frame(r#"{"method":"a","id":1}"#).unwrap();
-    let Frame::Request(req) = frame else {
-        panic!("expected Request, got {frame:?}");
-    };
-    assert_eq!(req.jsonrpc, None);
+fn parse_frame_rejects_missing_version() {
+    let resp = peer::parse_frame(r#"{"kind":"req","op":"foo","id":1}"#).unwrap_err();
+    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
 }
 
 #[test]
-fn validate_version_accepts_2_0_only() {
-    assert!(wire::validate_version("2.0").is_ok());
-    assert!(wire::validate_version("1.0").is_err());
-    assert!(wire::validate_version("").is_err());
+fn parse_frame_rejects_unknown_kind() {
+    let resp = peer::parse_frame(r#"{"ver":"1","kind":"unknown","id":1}"#).unwrap_err();
+    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
 }
-
-// ---------------------------------------------------------------------------
-// Arrays are rejected at the wire layer — batching is transport's job
-// ---------------------------------------------------------------------------
 
 #[test]
 fn parse_frame_rejects_array() {
-    // Spec §6 batches arrive as JSON arrays. The wire layer doesn't
-    // handle them — the transport is expected to split the array into
-    // individual frame strings and call parse_frame on each.
+    // Batching is a transport-layer concern; the wire parser handles
+    // one frame at a time.
     assert!(peer::parse_frame("[]").is_err());
-    assert!(peer::parse_frame(r#"[{"jsonrpc":"2.0","method":"a","id":1}]"#).is_err());
+    assert!(peer::parse_frame(r#"[{"ver":"1","kind":"req","op":"a","id":1}]"#).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +203,10 @@ fn parse_frame_rejects_array() {
 
 #[test]
 fn classify_response_yields_response_kind() {
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","id":7,"result":"ok"}"#).unwrap();
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"resp","id":7,"data":"ok"}"#).unwrap();
     match peer::classify(frame) {
         InboundKind::Response { id, outcome } => {
-            assert_eq!(id, Some(Id::Number(7)));
+            assert_eq!(id, Some(7u64));
             assert_eq!(outcome.unwrap(), json!("ok"));
         }
         other => panic!("expected Response, got {other:?}"),
@@ -266,7 +215,7 @@ fn classify_response_yields_response_kind() {
 
 #[test]
 fn classify_request_yields_incoming_request() {
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping","id":1}"#).unwrap();
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"req","op":"ping","id":1}"#).unwrap();
     assert!(matches!(
         peer::classify(frame),
         InboundKind::IncomingRequest(_)
@@ -275,7 +224,7 @@ fn classify_request_yields_incoming_request() {
 
 #[test]
 fn classify_notification_yields_incoming_notification() {
-    let frame = peer::parse_frame(r#"{"jsonrpc":"2.0","method":"ping"}"#).unwrap();
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"notif","op":"ping"}"#).unwrap();
     assert!(matches!(
         peer::classify(frame),
         InboundKind::IncomingNotification(_)
@@ -288,21 +237,19 @@ fn classify_notification_yields_incoming_notification() {
 
 #[test]
 fn peer_builders_compose_into_round_trip() {
-    // Peer A initiates a request; peer B receives, classifies, and
-    // replies; peer A receives the reply.
     let ids = peer::RequestIdGen::new();
     let id = ids.next_id();
-    let req = peer::request(id.clone(), "add", &json!([1, 2])).unwrap();
-    let req_wire = serde_json::to_string(&Frame::Request(req)).unwrap();
+    let req = peer::request(id, "add", &json!({"a": 1, "b": 2})).unwrap();
+    let req_wire = serde_json::to_string::<Frame>(&req.into()).unwrap();
 
     // peer B
     let inbound = match peer::classify(peer::parse_frame(&req_wire).unwrap()) {
         InboundKind::IncomingRequest(r) => r,
         _ => panic!("expected IncomingRequest"),
     };
-    assert_eq!(inbound.method, "add");
+    assert_eq!(inbound.op, "add");
     let reply = peer::response_ok_value(inbound.id, json!(3));
-    let reply_wire = serde_json::to_string(&Frame::Response(reply)).unwrap();
+    let reply_wire = serde_json::to_string::<Frame>(&reply.into()).unwrap();
 
     // peer A
     match peer::classify(peer::parse_frame(&reply_wire).unwrap()) {
@@ -316,144 +263,50 @@ fn peer_builders_compose_into_round_trip() {
 
 #[test]
 fn peer_notification_round_trip() {
-    let n = peer::notification("ping", &json!([])).unwrap();
-    let wire = serde_json::to_string(&Frame::Notification(n)).unwrap();
-    assert!(
-        !wire.contains("\"id\""),
-        "notification must not carry id: {wire}"
-    );
+    let n = peer::notification("ping", &json!({})).unwrap();
+    let wire = serde_json::to_string::<Frame>(&n.into()).unwrap();
+    assert!(!wire.contains("\"id\""), "notification must not carry id: {wire}");
     match peer::classify(peer::parse_frame(&wire).unwrap()) {
-        InboundKind::IncomingNotification(n) => assert_eq!(n.method, "ping"),
+        InboundKind::IncomingNotification(n) => assert_eq!(n.op, "ping"),
         _ => panic!("expected IncomingNotification"),
     }
 }
 
 #[test]
-fn peer_request_rejects_scalar_params() {
+fn peer_request_rejects_non_object_params() {
     let err = peer::request(1u64, "foo", &"bare").unwrap_err();
-    assert!(err.to_string().contains("Array or Object"));
+    assert!(err.to_string().contains("Object"));
 }
 
 #[test]
 fn peer_request_accepts_object_params() {
     let req = peer::request(1u64, "foo", &json!({"a": 1})).unwrap();
-    assert_eq!(req.method, "foo");
-    assert_eq!(req.id, Id::Number(1));
-    assert!(matches!(req.params, Some(Params::Object(_))));
+    assert_eq!(req.op, "foo");
+    assert_eq!(req.id, 1u64);
+    assert!(req.args.is_some());
 }
 
 // ---------------------------------------------------------------------------
-// Frame disambiguation — serde(untagged) order + deny_unknown_fields
-//
-// Pins down which JSON shape lands in which Frame variant, including
-// the malformed-shape cases that must fail at parse time rather than
-// silently land in a too-permissive variant.
+// Smoke tests — tagged-enum disambiguation works
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wire_disambiguation_response_ok_shape() {
-    let frame: Frame = serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":"v"}"#).unwrap();
-    assert!(matches!(frame, Frame::Response(Response::Ok(_))));
+fn wire_disambiguates_via_kind_tag() {
+    let req: Frame = serde_json::from_str(r#"{"ver":"1","kind":"req","id":1,"op":"do"}"#).unwrap();
+    assert!(matches!(req, Frame::V1(Content::Request(_))));
+
+    let resp: Frame = serde_json::from_str(r#"{"ver":"1","kind":"resp","id":1,"data":"v"}"#).unwrap();
+    assert!(matches!(resp, Frame::V1(Content::Response(_))));
+
+    let notif: Frame = serde_json::from_str(r#"{"ver":"1","kind":"notif","op":"do"}"#).unwrap();
+    assert!(matches!(notif, Frame::V1(Content::Notification(_))));
 }
 
 #[test]
-fn wire_disambiguation_response_err_shape() {
-    let frame: Frame =
-        serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#)
-            .unwrap();
-    assert!(matches!(frame, Frame::Response(Response::Err(_))));
-}
-
-#[test]
-fn wire_disambiguation_request_shape() {
-    // id + method, no result/error → Request
-    let frame: Frame = serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"do"}"#).unwrap();
-    assert!(matches!(frame, Frame::Request(_)));
-}
-
-#[test]
-fn wire_disambiguation_request_with_params() {
-    let frame: Frame =
-        serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"do","params":{"x":1}}"#).unwrap();
-    assert!(matches!(frame, Frame::Request(_)));
-}
-
-#[test]
-fn wire_disambiguation_notification_shape() {
-    // method, no id → Notification
-    let frame: Frame = serde_json::from_str(r#"{"jsonrpc":"2.0","method":"do"}"#).unwrap();
-    assert!(matches!(frame, Frame::Notification(_)));
-}
-
-#[test]
-fn wire_disambiguation_rejects_request_with_result_field() {
-    // id + method + result is malformed (looks like both a Request
-    // and a Response). deny_unknown_fields on Request rejects
-    // `result`; deny_unknown_fields on Response::Ok rejects `method`.
-    // Every variant must fail.
+fn wire_rejects_request_with_stray_field() {
+    // Request's deny_unknown_fields rejects extra fields.
     assert!(
-        serde_json::from_str::<Frame>(r#"{"jsonrpc":"2.0","id":1,"method":"do","result":"v"}"#)
+        serde_json::from_str::<Frame>(r#"{"ver":"1","kind":"req","id":1,"op":"do","stray":"v"}"#)
             .is_err()
-    );
-}
-
-#[test]
-fn wire_disambiguation_rejects_request_with_error_field() {
-    assert!(
-        serde_json::from_str::<Frame>(
-            r#"{"jsonrpc":"2.0","id":1,"method":"do","error":{"code":-1,"message":"x"}}"#
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn wire_disambiguation_rejects_notification_with_id() {
-    // If the wire actually carries `{method, id}`, the right
-    // classification is Request, not Notification. Notification's
-    // deny_unknown_fields rejects the id field, forcing the Request
-    // variant to win.
-    let frame: Frame = serde_json::from_str(r#"{"jsonrpc":"2.0","method":"do","id":5}"#).unwrap();
-    assert!(matches!(frame, Frame::Request(_)));
-}
-
-#[test]
-fn wire_disambiguation_rejects_response_with_method_field() {
-    // Reverse direction: a Response-shaped frame with stray method
-    // field is malformed.
-    assert!(
-        serde_json::from_str::<Frame>(
-            r#"{"jsonrpc":"2.0","id":1,"result":"v","method":"surprise"}"#
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn wire_disambiguation_rejects_id_only_object() {
-    // jsonrpc + id but no result/error/method — fits no variant.
-    assert!(serde_json::from_str::<Frame>(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
-}
-
-#[test]
-fn wire_disambiguation_rejects_jsonrpc_only_object() {
-    assert!(serde_json::from_str::<Frame>(r#"{"jsonrpc":"2.0"}"#).is_err());
-}
-
-#[test]
-fn wire_disambiguation_rejects_empty_object() {
-    assert!(serde_json::from_str::<Frame>("{}").is_err());
-}
-
-#[test]
-fn wire_disambiguation_rejects_response_with_both_result_and_error() {
-    // Spec §5 mutual exclusion enforced via deny_unknown_fields:
-    // ResponseOk rejects the error field, ResponseErr rejects the
-    // result field, so both inner variants of Response fail.
-    assert!(
-        serde_json::from_str::<Frame>(
-            r#"{"jsonrpc":"2.0","id":1,"result":"v","error":{"code":-1,"message":"x"}}"#
-        )
-        .is_err()
     );
 }

@@ -2,19 +2,19 @@
 
 use peerline::peer::{self, InboundKind};
 use peerline::pubsub::{self, PubsubMessage, SubscriptionIdGen};
-use peerline::wire::{Frame, Id, Notification, Params};
-use serde_json::json;
+use peerline::wire::{Frame, Notification};
+use serde_json::{json, Map};
 
 #[test]
-fn event_helper_returns_notification_with_method_event() {
+fn event_helper_returns_notification_with_op_event() {
     let n = pubsub::event("sub-0", &json!({"hello": "world"})).unwrap();
-    assert_eq!(n.method, "event");
+    assert_eq!(n.op, "event");
 }
 
 #[test]
-fn end_helper_returns_notification_with_method_end() {
+fn end_helper_returns_notification_with_op_end() {
     let n = pubsub::end("sub-9");
-    assert_eq!(n.method, "end");
+    assert_eq!(n.op, "end");
 }
 
 #[test]
@@ -42,34 +42,30 @@ fn end_round_trips_through_classify() {
 }
 
 #[test]
-fn classify_returns_none_for_non_pubsub_method() {
+fn classify_returns_none_for_non_pubsub_op() {
     let n = Notification {
-        jsonrpc: Some("2.0".into()),
-        method: "log".into(),
-        params: Some(Params::Object(serde_json::Map::new())),
+        op: "log".into(),
+        args: Some(Map::new()),
     };
     assert!(pubsub::classify(&n).is_none());
 }
 
 #[test]
-fn classify_returns_none_for_event_with_malformed_params() {
+fn classify_returns_none_for_event_with_malformed_args() {
+    let mut args = Map::new();
+    args.insert("event".into(), json!("x"));
     let n = Notification {
-        jsonrpc: Some("2.0".into()),
-        method: "event".into(),
-        params: Some(Params::Object(serde_json::Map::from_iter([(
-            "event".into(),
-            json!("x"),
-        )]))),
+        op: "event".into(),
+        args: Some(args),
     };
     assert!(pubsub::classify(&n).is_none());
 }
 
 #[test]
-fn classify_returns_none_for_event_without_params() {
+fn classify_returns_none_for_event_without_args() {
     let n = Notification {
-        jsonrpc: Some("2.0".into()),
-        method: "event".into(),
-        params: None,
+        op: "event".into(),
+        args: None,
     };
     assert!(pubsub::classify(&n).is_none());
 }
@@ -84,23 +80,17 @@ fn subscription_id_gen_is_monotonic() {
 
 #[test]
 fn unsubscribe_request_builds_with_typed_id() {
-    let req = pubsub::unsubscribe_request(Id::Number(5), "sub-3");
-    assert_eq!(req.method, "unsubscribe");
-    assert_eq!(req.id, Id::Number(5));
-    let params = req.params.expect("unsubscribe carries params").as_value();
-    assert_eq!(params, json!({"subscription_id": "sub-3"}));
-}
-
-#[test]
-fn unsubscribe_request_accepts_u64_via_into() {
-    let req = pubsub::unsubscribe_request(7u64, "sub-x");
-    assert_eq!(req.id, Id::Number(7));
+    let req = pubsub::unsubscribe_request(5u64, "sub-3");
+    assert_eq!(req.op, "unsubscribe");
+    assert_eq!(req.id, 5u64);
+    let args = req.args.expect("unsubscribe carries args");
+    assert_eq!(serde_json::Value::Object(args), json!({"subscription_id": "sub-3"}));
 }
 
 #[test]
 fn subscription_ack_round_trips_inside_response_ok() {
     let ack = pubsub::subscription_ack("sub-42");
-    let resp = peer::response_ok(Id::Number(1), &ack).unwrap();
+    let resp = peer::response_ok(1u64, &ack).unwrap();
     let result_value = resp.result().expect("ok response carries result");
     let parsed: pubsub::SubscriptionAck = serde_json::from_value(result_value.clone()).unwrap();
     assert_eq!(parsed.subscription_id, "sub-42");
@@ -112,12 +102,8 @@ fn subscription_ack_round_trips_inside_response_ok() {
 
 #[test]
 fn peer_inbound_notification_pipes_through_pubsub_classify() {
-    // End-to-end: pushing peer sends event via pubsub::event(),
-    // receiving peer parses the frame, classifies it generically as
-    // IncomingNotification, then pipes through pubsub::classify to
-    // get the typed PubsubMessage::Event.
     let push = pubsub::event("sub-0", &json!({"k": "v"})).unwrap();
-    let wire = serde_json::to_string(&Frame::Notification(push)).unwrap();
+    let wire = serde_json::to_string::<Frame>(&push.into()).unwrap();
     let frame = peer::parse_frame(&wire).unwrap();
     let notif = match peer::classify(frame) {
         InboundKind::IncomingNotification(n) => n,
@@ -138,7 +124,7 @@ fn peer_inbound_notification_pipes_through_pubsub_classify() {
 #[test]
 fn peer_inbound_end_notification_pipes_through_pubsub_classify() {
     let push = pubsub::end("sub-end");
-    let wire = serde_json::to_string(&Frame::Notification(push)).unwrap();
+    let wire = serde_json::to_string::<Frame>(&push.into()).unwrap();
     let notif = match peer::classify(peer::parse_frame(&wire).unwrap()) {
         InboundKind::IncomingNotification(n) => n,
         _ => panic!("expected IncomingNotification"),

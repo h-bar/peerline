@@ -1,4 +1,4 @@
-//! peerline — peer-symmetric JSON framing toolkit.
+//! peerline — peer-symmetric bidirectional RPC toolkit.
 //!
 //! peerline is a bidirectional messaging protocol where either
 //! endpoint can initiate any frame at any time. There are no
@@ -19,29 +19,43 @@
 //!   (`Open` / `Item` / `Close` / `Error` / `Cancel`) correlated to
 //!   the originating Request by `id`.
 //!
-//! All four are unified under [`wire::Frame`]. Both peers can send
-//! any variant; streams are bidi-capable with independent per-side
+//! All four are unified under [`wire::Frame`] via a two-level tagged
+//! enum: the outer `ver` tag selects the wire version (today only
+//! `"1"`) and the inner `kind` tag selects the envelope shape
+//! (`req` / `resp` / `notif` / `stream`). Both peers can send any
+//! variant; streams are bidi-capable with independent per-side
 //! half-close semantics.
 //!
-//! ### Wire-level interop with JSON-RPC 2.0
+//! ### Wire format
 //!
-//! The Request, Response, and Notification envelopes are
-//! wire-compatible with JSON-RPC 2.0: peerline emits the
-//! `"jsonrpc": "2.0"` marker on outbound frames so existing
-//! JSON-RPC tooling can speak the basic three envelopes without
-//! modification. The marker is accepted as optional on inbound
-//! frames, so peers that omit it (some MCP transports, app-server
-//! style protocols) decode cleanly.
+//! ```jsonc
+//! // request
+//! {"ver":"1", "kind":"req",   "id":7, "op":"foo", "args":{"x":1}}
+//! // success response
+//! {"ver":"1", "kind":"resp",  "id":7, "data":42}
+//! // error response (id may be null for parse-error replies)
+//! {"ver":"1", "kind":"resp",  "id":7, "err":{"code":-32603, "msg":"bad"}}
+//! // notification (no id)
+//! {"ver":"1", "kind":"notif",         "op":"event", "args":{...}}
+//! // stream item
+//! {"ver":"1", "kind":"stream","id":7, "seq":1, "data":{...}}
+//! ```
 //!
-//! Streaming and pubsub are peerline-native and have no JSON-RPC
-//! counterpart.
+//! Wire field names are kept ≤ 4 chars — `op` (operation), `args`
+//! (arguments), `data` (result / stream item), `err` (error), `seq`
+//! (stream sequence), `msg` (error message). Most Rust field names
+//! match the wire name directly; `#[serde(rename)]` bridges the few
+//! that differ.
+//!
+//! Adding a new wire version (`ver: "2"`) is purely additive — define
+//! `wire::v2::Content` and add a `V2(v2::Content)` variant to
+//! [`wire::Frame`]; v1 code is untouched.
 //!
 //! ### Modules
 //!
-//! - [`wire`] — frame envelope types, standard error code
-//!   constants, and the [`wire::validate_version`] helper.
-//!   Single-frame only: packing multiple frames in one wire
-//!   message is a transport-layer concern.
+//! - [`wire`] — frame envelope types, version-tag dispatch, standard
+//!   error code constants. Single-frame only: packing multiple frames
+//!   in one wire message is a transport-layer concern.
 //! - [`peer`] — peer-symmetric parsing + dispatch primitives.
 //!   [`peer::parse_frame`] turns a text frame into a [`wire::Frame`];
 //!   [`peer::classify`] dispatches it as [`peer::InboundKind`]
@@ -54,11 +68,9 @@
 //!   a [`pubsub::SubscriptionAck`]; the pushing peer sends
 //!   [`wire::Notification`]s with method `"event"` / `"end"`; the
 //!   receiving peer cancels with an `unsubscribe` request. Layered
-//!   on top of the core without modifying it — pass any
+//!   on top of the core — pass any
 //!   [`peer::InboundKind::IncomingNotification`] through
-//!   [`pubsub::classify`] to recognise pubsub messages. The same
-//!   convention is used by Ethereum's `eth_subscribe`, jsonrpsee,
-//!   and many other ecosystems.
+//!   [`pubsub::classify`] to recognise pubsub messages.
 //! - `runtime` *(optional, enable with `runtime` feature)* —
 //!   stateful [`Peer`](runtime::Peer) on top of the pure helpers:
 //!   pending-request map, handler registry, stream registry,
@@ -70,7 +82,7 @@
 //! Streaming is a first-class peerline feature, modelled as a
 //! phase-per-variant enum so each variant carries exactly the
 //! fields its lifecycle stage requires (the type system enforces
-//! the `data` ⇔ `Item` and `error` ⇔ `Error` invariants — no
+//! the `d` ⇔ `Item` and `e` ⇔ `Error` invariants — no
 //! runtime validation needed). Variants: `Open` (optional ack),
 //! `Item` (data element), `Close` (graceful half-close), `Error`
 //! (abnormal half-close), `Cancel` (full-close). All correlate to
