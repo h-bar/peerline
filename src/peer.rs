@@ -119,8 +119,13 @@ pub fn classify(frame: Frame) -> InboundKind {
 // and sends immediately, so boxing here would just add an allocation.
 #[allow(clippy::result_large_err)]
 pub fn parse_frame(text: &str) -> Result<Frame, Response> {
-    serde_json::from_str(text)
-        .map_err(|e| response_err(None, ErrorType::InvalidRequest, format!("invalid frame: {e}")))
+    serde_json::from_str(text).map_err(|e| {
+        response_err(
+            None,
+            ErrorType::InvalidRequest,
+            format!("invalid frame: {e}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +141,7 @@ pub fn request<T: Serialize>(
 ) -> Result<Request, serde_json::Error> {
     let value = serde_json::to_value(args)?;
     let typed = params_from_value(value).ok_or_else(|| {
-        <serde_json::Error as serde::ser::Error>::custom(
-            "args must serialize to a JSON Object",
-        )
+        <serde_json::Error as serde::ser::Error>::custom("args must serialize to a JSON Object")
     })?;
     Ok(Request {
         id: id.into(),
@@ -165,9 +168,7 @@ pub fn notification<T: Serialize>(
 ) -> Result<Notification, serde_json::Error> {
     let value = serde_json::to_value(args)?;
     let typed = params_from_value(value).ok_or_else(|| {
-        <serde_json::Error as serde::ser::Error>::custom(
-            "args must serialize to a JSON Object",
-        )
+        <serde_json::Error as serde::ser::Error>::custom("args must serialize to a JSON Object")
     })?;
     Ok(Notification {
         op: op.into(),
@@ -211,11 +212,7 @@ pub fn response_ok_value(id: impl Into<Id>, result: Value) -> Response {
 
 /// Build an error [`Response`]. Pass `None` for `id` on parse-error
 /// replies where the responder couldn't recover the original id.
-pub fn response_err(
-    id: Option<Id>,
-    code: impl Into<i32>,
-    message: impl Into<String>,
-) -> Response {
+pub fn response_err(id: Option<Id>, code: impl Into<i32>, message: impl Into<String>) -> Response {
     Response::Err(ResponseErr {
         id,
         error: RpcError {

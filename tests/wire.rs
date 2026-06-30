@@ -1,9 +1,7 @@
 //! Wire-shape round-trip tests for the peer-symmetric core.
 
 use peerline::peer::{self, InboundKind};
-use peerline::wire::{
-    Content, ErrorType, Frame, Response, ResponseErr, RpcError,
-};
+use peerline::wire::{Content, ErrorType, Frame, Response, ResponseErr, RpcError};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +155,8 @@ fn parse_frame_classifies_response_ok() {
 #[test]
 fn parse_frame_classifies_response_err() {
     let frame =
-        peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"err":{"code":-1,"msg":"x"}}"#).unwrap();
+        peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"err":{"code":-1,"msg":"x"}}"#)
+            .unwrap();
     assert!(matches!(
         frame,
         Frame::V1(Content::Response(Response::Err(_)))
@@ -167,26 +166,38 @@ fn parse_frame_classifies_response_err() {
 #[test]
 fn parse_frame_returns_invalid_request_for_invalid_json() {
     let resp = peer::parse_frame("not json").unwrap_err();
-    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
+    assert_eq!(
+        resp.error().unwrap().error_type(),
+        ErrorType::InvalidRequest
+    );
     assert_eq!(resp.id(), None);
 }
 
 #[test]
 fn parse_frame_rejects_unknown_version() {
     let resp = peer::parse_frame(r#"{"ver":"999","kind":"req","op":"foo","id":1}"#).unwrap_err();
-    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
+    assert_eq!(
+        resp.error().unwrap().error_type(),
+        ErrorType::InvalidRequest
+    );
 }
 
 #[test]
 fn parse_frame_rejects_missing_version() {
     let resp = peer::parse_frame(r#"{"kind":"req","op":"foo","id":1}"#).unwrap_err();
-    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
+    assert_eq!(
+        resp.error().unwrap().error_type(),
+        ErrorType::InvalidRequest
+    );
 }
 
 #[test]
 fn parse_frame_rejects_unknown_kind() {
     let resp = peer::parse_frame(r#"{"ver":"1","kind":"unknown","id":1}"#).unwrap_err();
-    assert_eq!(resp.error().unwrap().error_type(), ErrorType::InvalidRequest);
+    assert_eq!(
+        resp.error().unwrap().error_type(),
+        ErrorType::InvalidRequest
+    );
 }
 
 #[test]
@@ -265,7 +276,10 @@ fn peer_builders_compose_into_round_trip() {
 fn peer_notification_round_trip() {
     let n = peer::notification("ping", &json!({})).unwrap();
     let wire = serde_json::to_string::<Frame>(&n.into()).unwrap();
-    assert!(!wire.contains("\"id\""), "notification must not carry id: {wire}");
+    assert!(
+        !wire.contains("\"id\""),
+        "notification must not carry id: {wire}"
+    );
     match peer::classify(peer::parse_frame(&wire).unwrap()) {
         InboundKind::IncomingNotification(n) => assert_eq!(n.op, "ping"),
         _ => panic!("expected IncomingNotification"),
@@ -295,7 +309,8 @@ fn wire_disambiguates_via_kind_tag() {
     let req: Frame = serde_json::from_str(r#"{"ver":"1","kind":"req","id":1,"op":"do"}"#).unwrap();
     assert!(matches!(req, Frame::V1(Content::Request(_))));
 
-    let resp: Frame = serde_json::from_str(r#"{"ver":"1","kind":"resp","id":1,"data":"v"}"#).unwrap();
+    let resp: Frame =
+        serde_json::from_str(r#"{"ver":"1","kind":"resp","id":1,"data":"v"}"#).unwrap();
     assert!(matches!(resp, Frame::V1(Content::Response(_))));
 
     let notif: Frame = serde_json::from_str(r#"{"ver":"1","kind":"notif","op":"do"}"#).unwrap();

@@ -3,7 +3,7 @@
 use peerline::peer::{self, InboundKind};
 use peerline::pubsub::{self, PubsubMessage, SubscriptionIdGen};
 use peerline::wire::{Frame, Notification};
-use serde_json::{json, Map};
+use serde_json::{Map, json};
 
 #[test]
 fn event_helper_returns_notification_with_op_event() {
@@ -84,7 +84,10 @@ fn unsubscribe_request_builds_with_typed_id() {
     assert_eq!(req.op, "unsubscribe");
     assert_eq!(req.id, 5u64);
     let args = req.args.expect("unsubscribe carries args");
-    assert_eq!(serde_json::Value::Object(args), json!({"subscription_id": "sub-3"}));
+    assert_eq!(
+        serde_json::Value::Object(args),
+        json!({"subscription_id": "sub-3"})
+    );
 }
 
 #[test]

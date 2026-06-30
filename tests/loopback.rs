@@ -70,7 +70,10 @@ async fn call_unknown_method_returns_method_not_found() {
     let err = a.call::<_, ()>("nope", &json!({})).await.unwrap_err();
     match err {
         runtime::Error::Rpc(rpc_err) => {
-            assert_eq!(rpc_err.error_type(), peerline::wire::ErrorType::MethodNotFound);
+            assert_eq!(
+                rpc_err.error_type(),
+                peerline::wire::ErrorType::MethodNotFound
+            );
         }
         other => panic!("expected Rpc error, got {other:?}"),
     }
@@ -196,8 +199,7 @@ async fn call_stream_propagates_handler_error() {
         })
     });
 
-    let mut stream: runtime::StreamReceiver<String> =
-        a.call_stream("boom", &json!({})).unwrap();
+    let mut stream: runtime::StreamReceiver<String> = a.call_stream("boom", &json!({})).unwrap();
 
     let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.seq, 0);
@@ -233,8 +235,7 @@ async fn dropping_stream_receiver_is_silent_handler_still_runs() {
     });
 
     {
-        let _stream: runtime::StreamReceiver<String> =
-            a.call_stream("tail", &json!({})).unwrap();
+        let _stream: runtime::StreamReceiver<String> = a.call_stream("tail", &json!({})).unwrap();
     }
 
     tokio::time::timeout(Duration::from_secs(1), handler_done.notified())
@@ -250,15 +251,27 @@ async fn dropping_stream_receiver_is_silent_handler_still_runs() {
 async fn either_peer_can_initiate_a_call() {
     let (a, b) = wire_loopback();
 
-    a.on_request("echo", |p: EchoArgs| async move {
-        Ok::<_, RpcError>(p.s)
-    });
-    b.on_request("echo", |p: EchoArgs| async move {
-        Ok::<_, RpcError>(p.s)
-    });
+    a.on_request("echo", |p: EchoArgs| async move { Ok::<_, RpcError>(p.s) });
+    b.on_request("echo", |p: EchoArgs| async move { Ok::<_, RpcError>(p.s) });
 
-    let from_a: String = a.call("echo", &EchoArgs { s: "hello-b".into() }).await.unwrap();
-    let from_b: String = b.call("echo", &EchoArgs { s: "hello-a".into() }).await.unwrap();
+    let from_a: String = a
+        .call(
+            "echo",
+            &EchoArgs {
+                s: "hello-b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let from_b: String = b
+        .call(
+            "echo",
+            &EchoArgs {
+                s: "hello-a".into(),
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(from_a, "hello-b");
     assert_eq!(from_b, "hello-a");
 }

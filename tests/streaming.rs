@@ -25,7 +25,10 @@ fn stream_item_round_trips() {
     let wire = serde_json::to_string::<Frame>(&frame.into()).unwrap();
     assert!(wire.contains("\"seq\":1"));
     assert!(wire.contains("\"data\""));
-    assert!(!wire.contains("\"ph\""), "ph field should not exist anymore: {wire}");
+    assert!(
+        !wire.contains("\"ph\""),
+        "ph field should not exist anymore: {wire}"
+    );
 
     let back = match serde_json::from_str::<Frame>(&wire).unwrap() {
         Frame::V1(Content::Stream(s)) => s,
@@ -46,8 +49,14 @@ fn stream_terminal_empty_round_trips() {
 
     let wire = serde_json::to_string::<Frame>(&frame.into()).unwrap();
     assert!(wire.contains("\"seq\":-1"));
-    assert!(!wire.contains("\"data\""), "empty terminal shouldn't carry data: {wire}");
-    assert!(!wire.contains("\"err\""), "empty terminal shouldn't carry err: {wire}");
+    assert!(
+        !wire.contains("\"data\""),
+        "empty terminal shouldn't carry data: {wire}"
+    );
+    assert!(
+        !wire.contains("\"err\""),
+        "empty terminal shouldn't carry err: {wire}"
+    );
 }
 
 #[test]
@@ -80,12 +89,8 @@ fn stream_terminal_with_error_round_trips() {
 
 #[test]
 fn stream_terminal_with_error_data_carries_inner_data() {
-    let frame = peer::stream_terminal_with_error_data(
-        7u64,
-        -32000,
-        "boom",
-        json!({"sentry": "abc"}),
-    );
+    let frame =
+        peer::stream_terminal_with_error_data(7u64, -32000, "boom", json!({"sentry": "abc"}));
     assert!(frame.is_terminal());
     let e = frame.error.as_ref().unwrap();
     assert_eq!(e.data, Some(json!({"sentry": "abc"})));
@@ -97,10 +102,8 @@ fn stream_terminal_with_error_data_carries_inner_data() {
 
 #[test]
 fn parse_frame_classifies_stream_item() {
-    let frame = peer::parse_frame(
-        r#"{"ver":"1","kind":"stream","id":1,"seq":42,"data":[1,2,3]}"#,
-    )
-    .unwrap();
+    let frame =
+        peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":42,"data":[1,2,3]}"#).unwrap();
     let s = match frame {
         Frame::V1(Content::Stream(s)) => s,
         other => panic!("expected Stream, got {other:?}"),
@@ -125,10 +128,9 @@ fn parse_frame_classifies_empty_terminal() {
 
 #[test]
 fn parse_frame_classifies_terminal_with_data() {
-    let frame = peer::parse_frame(
-        r#"{"ver":"1","kind":"stream","id":1,"seq":-1,"data":{"final":true}}"#,
-    )
-    .unwrap();
+    let frame =
+        peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":-1,"data":{"final":true}}"#)
+            .unwrap();
     let s = match frame {
         Frame::V1(Content::Stream(s)) => s,
         other => panic!("expected Stream, got {other:?}"),
@@ -158,9 +160,8 @@ fn parse_frame_classifies_terminal_with_error() {
 #[test]
 fn stream_frame_rejects_unknown_field() {
     // deny_unknown_fields blocks stray fields.
-    let frame = peer::parse_frame(
-        r#"{"ver":"1","kind":"stream","id":1,"seq":1,"data":1,"surprise":42}"#,
-    );
+    let frame =
+        peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":1,"data":1,"surprise":42}"#);
     assert!(frame.is_err(), "stray field should be rejected");
 }
 
@@ -176,10 +177,8 @@ fn stream_frame_rejects_missing_seq() {
 
 #[test]
 fn classify_stream_yields_stream_kind() {
-    let frame = peer::parse_frame(
-        r#"{"ver":"1","kind":"stream","id":1,"seq":3,"data":{"k":"v"}}"#,
-    )
-    .unwrap();
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":3,"data":{"k":"v"}}"#)
+        .unwrap();
     match peer::classify(frame) {
         InboundKind::Stream(s) => {
             assert_eq!(s.id, 1);

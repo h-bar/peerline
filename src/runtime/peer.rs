@@ -484,12 +484,7 @@ async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response
 
     // Try streaming handler first — if present, it gets a StreamSender
     // and produces no Response (the stream:* frames carry the reply).
-    let stream_handler = inner
-        .stream_handlers
-        .lock()
-        .unwrap()
-        .get(&req.op)
-        .cloned();
+    let stream_handler = inner.stream_handlers.lock().unwrap().get(&req.op).cloned();
     if let Some(handler) = stream_handler {
         let sender = StreamSender::new(id, inner.clone());
         handler(args_value, sender).await;
@@ -497,12 +492,7 @@ async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response
     }
 
     // Unary request handler — returns Some(Response).
-    let unary_handler = inner
-        .request_handlers
-        .lock()
-        .unwrap()
-        .get(&req.op)
-        .cloned();
+    let unary_handler = inner.request_handlers.lock().unwrap().get(&req.op).cloned();
     let response = match unary_handler {
         Some(handler) => match handler(args_value).await {
             Ok(value) => p::response_ok_value(id, value),
