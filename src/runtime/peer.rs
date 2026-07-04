@@ -11,6 +11,7 @@
 //! `wasm-bindgen-futures`, `futures::executor::block_on`, …
 
 use super::error::Error;
+use super::outbound::{Outbound, forward_outbound};
 use super::stream::{StreamReceiver, StreamSender};
 use crate::peer as p;
 use crate::peer::{InboundKind, RequestIdGen};
@@ -19,7 +20,7 @@ use crate::wire::{
 };
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
-use futures::sink::{Sink, SinkExt};
+use futures::sink::Sink;
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
@@ -56,14 +57,11 @@ pub(crate) struct PeerInner {
     request_handlers: Mutex<HashMap<String, RequestHandler>>,
     notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
     stream_handlers: Mutex<HashMap<String, StreamHandler>>,
-    pub(crate) outbound: mpsc::UnboundedSender<String>,
-    /// Number of frames queued in `outbound` that haven't been
-    /// drained by the wire writer yet. Bumped by [`send_frame`] /
-    /// [`super::stream`]'s send paths; decremented by
-    /// [`forward_outbound`]. Surfaces in [`Peer::metrics`] so
-    /// operators can spot a slow / dead client (TCP send blocked)
-    /// before the unbounded queue eats memory.
-    pub(crate) outbound_depth: AtomicUsize,
+    /// Fair outbound scheduler — control-priority queue plus per-stream
+    /// round-robin queues (see [`super::outbound`]). Every outgoing
+    /// frame routes through here; [`send_frame`] enqueues control
+    /// frames, [`StreamSender`] enqueues stream items.
+    pub(crate) outbound: Arc<Outbound>,
     /// In-flight handler futures pushed onto the dispatch loop's
     /// `FuturesUnordered`. Bumped when [`on_inbound_text`] pushes
     /// a new handler; decremented when the handler completes (via
@@ -105,6 +103,22 @@ pub struct Metrics {
     /// completes. Grows if handlers take longer to finish than
     /// they arrive.
     pub inflight_handlers: usize,
+    /// Largest per-stream outbound queue depth across all active
+    /// outbound streams — the single stream furthest behind the
+    /// writer. A persistently high value points at one stream
+    /// outrunning a slow transport.
+    pub stream_items_queued_max: usize,
+    /// Sum of queued items across all active outbound stream queues.
+    /// Together with `outbound_depth` this separates stream-payload
+    /// backlog from control-frame backlog.
+    pub stream_items_queued_total: usize,
+    /// Cumulative outbound streams cancelled by a consumer dropping
+    /// its `StreamReceiver` (the reserved cancel notification was
+    /// received and the producer's queue closed).
+    pub cancelled_streams: u64,
+    /// Cumulative frames the outbound scheduler has dispatched to the
+    /// transport. A fairness/throughput odometer.
+    pub scheduler_rounds: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +168,7 @@ impl Peer {
         SiE: std::fmt::Display + 'static,
         StE: std::fmt::Display + 'static,
     {
-        let (out_tx, out_rx) = mpsc::unbounded();
+        let (outbound, rxs) = Outbound::new();
         let inner = Arc::new(PeerInner {
             ids: RequestIdGen::new(),
             pending: Mutex::new(HashMap::new()),
@@ -162,15 +176,14 @@ impl Peer {
             request_handlers: Mutex::new(HashMap::new()),
             notification_handlers: Mutex::new(HashMap::new()),
             stream_handlers: Mutex::new(HashMap::new()),
-            outbound: out_tx,
-            outbound_depth: AtomicUsize::new(0),
+            outbound,
             inflight_handlers: AtomicUsize::new(0),
         });
         let peer = Self {
             inner: inner.clone(),
         };
         let driver = async move {
-            let writer = Box::pin(forward_outbound(out_rx, inner.clone(), sink));
+            let writer = Box::pin(forward_outbound(inner.outbound.clone(), rxs, sink));
             let reader = Box::pin(run_inbound(inner, stream));
             // Exit when either side ends; the other future is dropped.
             let _ = futures::future::select(writer, reader).await;
@@ -191,11 +204,17 @@ impl Peer {
     /// to invoke at any rate.
     #[must_use]
     pub fn metrics(&self) -> Metrics {
+        let outbound = &self.inner.outbound;
+        let (stream_items_queued_max, stream_items_queued_total) = outbound.stream_depths();
         Metrics {
             pending_responses: self.inner.pending.lock().unwrap().len(),
             active_streams: self.inner.streams.lock().unwrap().len(),
-            outbound_depth: self.inner.outbound_depth.load(Ordering::Acquire),
+            outbound_depth: outbound.outbound_depth.load(Ordering::Acquire),
             inflight_handlers: self.inner.inflight_handlers.load(Ordering::Acquire),
+            stream_items_queued_max,
+            stream_items_queued_total,
+            cancelled_streams: outbound.cancelled_streams.load(Ordering::Relaxed),
+            scheduler_rounds: outbound.scheduler_rounds.load(Ordering::Relaxed),
         }
     }
 
@@ -328,12 +347,12 @@ impl Peer {
         let h: StreamHandler = Arc::new(move |args: serde_json::Value, sender: StreamSender| {
             let f = f.clone();
             let id = sender.id;
-            let inner = sender.state.clone();
+            let outbound = sender.outbound.clone();
             Box::pin(async move {
                 // Guard sends an empty terminal if the future drops
                 // (panic, executor cancel) before reaching the
                 // explicit terminal in the success / error branches.
-                let mut guard = super::stream::TerminalGuard::new(id, inner.clone());
+                let mut guard = super::stream::TerminalGuard::new(id, outbound);
                 match serde_json::from_value::<A>(args) {
                     Ok(a) => match f(a, sender).await {
                         Ok(()) => guard.send_normal(),
@@ -439,6 +458,22 @@ fn on_inbound_text(
             }));
         }
         InboundKind::IncomingNotification(notif) => {
+            // Reserved cancel notification is intercepted here, before
+            // user notification handlers: route it to the outbound
+            // scheduler to close the producing stream's queue (its
+            // handler's next send then fails). Never dispatched to a
+            // user handler.
+            if notif.op == super::STREAM_CANCEL_OP {
+                if let Some(id) = notif
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.get("id"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    inner.outbound.cancel_stream(id);
+                }
+                return;
+            }
             let inner = inner.clone();
             let guard = InflightGuard::new(inner.clone());
             handler_tasks.push(Box::pin(async move {
@@ -525,40 +560,15 @@ async fn process_notification(inner: Arc<PeerInner>, notif: Notification) {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Serialize a frame and enqueue it on `inner.outbound`. Bumps
-/// `inner.outbound_depth` so [`Peer::metrics`] reflects the
-/// queued frame; [`forward_outbound`] decrements after the wire
-/// write succeeds. On a closed-channel error the bump is
-/// rolled back so the counter stays accurate.
+/// Serialize a frame and enqueue it on the scheduler's priority
+/// control queue (see [`super::outbound`]). Used for responses,
+/// notifications, this peer's own requests, and cancel notifications —
+/// everything except stream item frames, which route through the
+/// per-stream queues via [`StreamSender`]. The scheduler's writer
+/// decrements the queue depth after the wire write.
 pub(crate) fn send_frame<F: Into<Frame>>(inner: &PeerInner, frame: F) -> Result<(), Error> {
     let text = serde_json::to_string(&frame.into())?;
-    inner.outbound_depth.fetch_add(1, Ordering::AcqRel);
-    inner.outbound.unbounded_send(text).map_err(|_| {
-        inner.outbound_depth.fetch_sub(1, Ordering::AcqRel);
-        Error::Closed
-    })
-}
-
-/// Drain the outbound text-frame receiver into the user-supplied
-/// transport sink. Exits when the receiver is exhausted (all Peers
-/// dropped) or the sink errors / closes. Decrements
-/// `inner.outbound_depth` per frame written so the counter mirrors
-/// the real queue depth.
-async fn forward_outbound<Si, SiE>(
-    mut rx: mpsc::UnboundedReceiver<String>,
-    inner: Arc<PeerInner>,
-    mut sink: Si,
-) where
-    Si: Sink<String, Error = SiE> + Unpin,
-    SiE: std::fmt::Display,
-{
-    while let Some(text) = rx.next().await {
-        inner.outbound_depth.fetch_sub(1, Ordering::AcqRel);
-        if sink.send(text).await.is_err() {
-            break;
-        }
-    }
-    let _ = sink.close().await;
+    inner.outbound.enqueue_control(text)
 }
 
 fn args_into_value(args: Option<Params>) -> serde_json::Value {

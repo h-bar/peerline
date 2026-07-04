@@ -216,11 +216,14 @@ async fn call_stream_propagates_handler_error() {
 }
 
 #[tokio::test]
-async fn dropping_stream_receiver_is_silent_handler_still_runs() {
-    // Dropping the StreamReceiver removes the entry from the local
-    // stream registry; no wire frame is sent. The producer keeps
-    // running and the handler completes normally — we verify by
-    // signalling from inside the handler.
+async fn dropping_stream_receiver_cancels_but_nonsending_handler_completes() {
+    // Dropping the StreamReceiver now emits a reserved cancel
+    // notification and removes the local registry entry. A handler
+    // that never sends can't observe the cancellation (cancellation
+    // surfaces as a send failure), so it still completes normally —
+    // we verify by signalling from inside the handler. See
+    // tests/fairness.rs for the case where a *sending* handler
+    // observes the cancel via `Error::Closed`.
     let (a, b) = wire_loopback();
     let handler_done = Arc::new(Notify::new());
     let handler_done_clone = handler_done.clone();

@@ -27,10 +27,14 @@
 //!
 //! ### Cancel-on-drop streams
 //!
-//! Returned [`StreamReceiver`]s send a `stream:cancel` frame and
-//! remove themselves from the registry when dropped. The consumer
-//! gets gRPC-flavoured "drop the handle and the server stops
-//! producing" semantics for free.
+//! Returned [`StreamReceiver`]s send a reserved cancel notification
+//! ([`STREAM_CANCEL_OP`]) and remove themselves from the registry when
+//! dropped; the producing peer intercepts it and closes that stream's
+//! outbound queue, so the handler's next send fails. A handler can also
+//! await [`StreamSender::cancelled`] to stop expensive upstream work
+//! the moment the consumer leaves, without waiting for its next send.
+//! The consumer gets gRPC-flavoured "drop the handle and the server
+//! stops producing" semantics for free.
 //!
 //! ### Runtime-agnostic
 //!
@@ -44,6 +48,7 @@
 //! box (no `tokio::spawn`, no thread-local runtime handle).
 
 mod error;
+mod outbound;
 mod peer;
 mod stream;
 
@@ -52,6 +57,14 @@ pub use peer::{Metrics, Peer};
 pub use stream::{StreamItem, StreamReceiver, StreamSender};
 
 use futures::stream::StreamExt;
+
+/// Reserved notification op for stream cancellation. A dropped
+/// [`StreamReceiver`] emits this (carrying the stream id) so the
+/// producing peer closes that stream's outbound queue. The `$`-prefix
+/// namespaces it away from application op names; the dispatch loop
+/// intercepts it before user notification handlers, so registering a
+/// handler for this op has no effect.
+pub(crate) const STREAM_CANCEL_OP: &str = "$peerline/stream.cancel";
 
 /// Wire two peers together in-process via two `mpsc::unbounded`
 /// pairs (A → B and B → A). Returns both peers plus a driver

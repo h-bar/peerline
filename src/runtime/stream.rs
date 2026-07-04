@@ -1,9 +1,10 @@
 //! Stream-side wrappers for peerline's streaming layer.
 
 use super::error::Error;
+use super::outbound::{Outbound, StreamMeta};
 use super::peer::{PeerInner, send_frame};
 use crate::peer as p;
-use crate::wire::{Id, RpcError, STREAM_TERMINAL_SEQ, StreamFrame};
+use crate::wire::{Frame, Id, RpcError, STREAM_TERMINAL_SEQ, StreamFrame};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::stream::Stream;
@@ -13,6 +14,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+
+/// Args for the reserved stream-cancel notification (see
+/// [`super::STREAM_CANCEL_OP`]) — carries just the stream id.
+#[derive(Serialize)]
+struct CancelArgs {
+    id: Id,
+}
 
 // ---------------------------------------------------------------------------
 // StreamSender — server-side handle for pushing items
@@ -34,39 +42,63 @@ use std::task::{Context, Poll};
 /// `Err(rpc_err)` for abnormal end). See [`crate::Peer::on_stream_request`].
 pub struct StreamSender {
     pub(crate) id: Id,
-    pub(crate) state: Arc<PeerInner>,
+    /// Shared scheduler — used for depth accounting and (by the runtime
+    /// wrapper) the terminal frame via [`Outbound::finish_stream`].
+    pub(crate) outbound: Arc<Outbound>,
+    /// Producer half of this stream's outbound channel.
+    tx: mpsc::UnboundedSender<String>,
+    /// Shared depth counter for this stream (observability).
+    meta: Arc<StreamMeta>,
     /// Next `seq` to stamp on an outgoing item. Items are 0-indexed —
-    /// the first `send_item` call sends `seq = 0` (which implicitly
-    /// opens the stream), the second sends `seq = 1`, etc.
+    /// the first send stamps `seq = 0` (which implicitly opens the
+    /// stream), the second `seq = 1`, etc.
     next_seq: AtomicU64,
 }
 
 impl StreamSender {
     pub(crate) fn new(id: Id, state: Arc<PeerInner>) -> Self {
+        let outbound = state.outbound.clone();
+        let (tx, meta) = outbound.open_stream(id);
         Self {
             id,
-            state,
+            outbound,
+            tx,
+            meta,
             next_seq: AtomicU64::new(0),
         }
     }
 
     /// Send one stream-item frame with the next monotonic `seq`.
-    /// First call sends `seq = 0` (implicitly opens the stream),
-    /// second `seq = 1`, etc., unless [`Self::skip`] has advanced
-    /// the counter.
+    ///
+    /// Non-blocking: the item is enqueued on this stream's outbound
+    /// queue and the call returns immediately — a slow or dead consumer
+    /// never blocks the producer. The queue is unbounded, so this only
+    /// fails ([`Error::Closed`]) once the stream is cancelled (consumer
+    /// dropped its receiver) or the connection closes. Backlog from a
+    /// slow consumer is allowed to grow and is surfaced via
+    /// [`super::Peer::metrics`] rather than throttled.
+    ///
+    /// First call stamps `seq = 0` (implicitly opens the stream), then
+    /// `seq = 1`, etc., unless [`Self::skip`] has advanced the counter.
     pub fn send_item<T: Serialize>(&self, data: &T) -> Result<(), Error> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let item = p::stream_item(self.id, seq, data)?;
-        send_frame(&self.state, item)
+        let text = serde_json::to_string(&Frame::from(p::stream_item(self.id, seq, data)?))?;
+        self.meta.depth.fetch_add(1, Ordering::AcqRel);
+        self.outbound.outbound_depth.fetch_add(1, Ordering::AcqRel);
+        self.tx.unbounded_send(text).map_err(|_| {
+            self.meta.depth.fetch_sub(1, Ordering::AcqRel);
+            self.outbound.outbound_depth.fetch_sub(1, Ordering::AcqRel);
+            Error::Closed
+        })
     }
 
     /// Advance the `seq` counter by `count` **without** sending an
     /// item. Use when the sender's upstream source dropped `count`
     /// items it would otherwise have transmitted (e.g. a
     /// `broadcast::Receiver` returned `Lagged(count)` because this
-    /// sender's subscriber was too slow). The next [`Self::send_item`]
-    /// will produce a `seq` that's `count + 1` past the last one,
-    /// so receivers see the gap and can recover out of band.
+    /// sender's subscriber was too slow). The next send will produce a
+    /// `seq` that's `count + 1` past the last one, so receivers see the
+    /// gap and can recover out of band.
     ///
     /// Sync + non-failing (just bumps an atomic). `count == 0` is a
     /// no-op.
@@ -74,6 +106,48 @@ impl StreamSender {
         if count > 0 {
             self.next_seq.fetch_add(count, Ordering::AcqRel);
         }
+    }
+
+    /// A future that resolves once the consumer cancels this stream
+    /// (drops its [`StreamReceiver`]). Handlers doing expensive
+    /// upstream work can `select!` on this to stop promptly, instead of
+    /// only discovering the cancellation on their next
+    /// [`Self::send_item`] (which returns [`Error::Closed`]):
+    ///
+    /// ```ignore
+    /// loop {
+    ///     tokio::select! {
+    ///         _ = sender.cancelled() => break,          // consumer left
+    ///         row = db.next() => sender.send_item(&row)?,
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Resolves immediately if the stream is already cancelled. A
+    /// [`StreamSender`] serves a single handler, so this is intended to
+    /// be awaited from one place at a time.
+    pub fn cancelled(&self) -> impl std::future::Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.meta.cancelled.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            self.meta.cancel_waker.register(cx.waker());
+            // Re-check to close the race with a cancel landing between
+            // the load above and the waker registration.
+            if self.meta.cancelled.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+
+    /// `true` if the consumer has cancelled this stream (dropped its
+    /// receiver). Non-blocking snapshot; see [`Self::cancelled`] for an
+    /// awaitable version.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.meta.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -89,15 +163,15 @@ impl StreamSender {
 /// terminal so the consumer doesn't hang.
 pub(crate) struct TerminalGuard {
     id: Id,
-    state: Arc<PeerInner>,
+    outbound: Arc<Outbound>,
     sent: bool,
 }
 
 impl TerminalGuard {
-    pub(crate) fn new(id: Id, state: Arc<PeerInner>) -> Self {
+    pub(crate) fn new(id: Id, outbound: Arc<Outbound>) -> Self {
         Self {
             id,
-            state,
+            outbound,
             sent: false,
         }
     }
@@ -105,16 +179,21 @@ impl TerminalGuard {
     pub(crate) fn send_normal(&mut self) {
         if !self.sent {
             self.sent = true;
-            let _ = send_frame(&self.state, p::stream_terminal(self.id));
+            self.outbound
+                .finish_stream(self.id, terminal_text(p::stream_terminal(self.id)));
         }
     }
 
     pub(crate) fn send_error(&mut self, error: RpcError) {
         if !self.sent {
             self.sent = true;
-            let _ = send_frame(
-                &self.state,
-                p::stream_terminal_with_error(self.id, error.code, error.message),
+            self.outbound.finish_stream(
+                self.id,
+                terminal_text(p::stream_terminal_with_error(
+                    self.id,
+                    error.code,
+                    error.message,
+                )),
             );
         }
     }
@@ -126,9 +205,19 @@ impl Drop for TerminalGuard {
             // Handler future dropped without returning — send a plain
             // empty terminal so the consumer knows the stream is over.
             self.sent = true;
-            let _ = send_frame(&self.state, p::stream_terminal(self.id));
+            self.outbound
+                .finish_stream(self.id, terminal_text(p::stream_terminal(self.id)));
         }
     }
+}
+
+/// Serialize a terminal [`StreamFrame`] into a wire string. Terminal
+/// frames carry no user payload, so serialization is infallible in
+/// practice; on the impossible error we fall back to an empty string,
+/// which `finish_stream` still delivers (and the peer would surface as
+/// a parse error rather than a silent hang).
+fn terminal_text(frame: StreamFrame) -> String {
+    serde_json::to_string(&Frame::from(frame)).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -241,10 +330,15 @@ impl<R: DeserializeOwned + Unpin> Stream for StreamReceiver<R> {
 impl<R> Drop for StreamReceiver<R> {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            // Pure local cleanup — no wire frame is sent. The producer
-            // continues until it naturally terminates; frames arriving
-            // for this id after drop are silently discarded by the
-            // dispatch loop (no registry entry to route to).
+            // Real cancel-on-drop: tell the producing peer to stop. The
+            // reserved cancel notification is intercepted on the far
+            // side before user handlers and closes that stream's
+            // outbound queue, so its handler's next send fails. Any
+            // frames still in flight for this id are discarded locally
+            // (no registry entry left to route to).
+            if let Ok(notif) = p::notification(super::STREAM_CANCEL_OP, &CancelArgs { id }) {
+                let _ = send_frame(&self.state, notif);
+            }
             if let Ok(mut guard) = self.state.streams.lock() {
                 guard.remove(&id);
             }
