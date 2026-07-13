@@ -106,6 +106,129 @@ fn response_with_null_data_parses_as_ok() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Payload matrix — the whole risk surface of the hand-written codec.
+//
+// The 0.0.3 deadlock was a payload-value-shape bug (present `null` mistaken
+// for absent). These pin every payload-bearing frame against every JSON
+// value shape, and the presence-vs-absence distinction, so that class of
+// bug can't recur silently.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn payload_value_shapes_round_trip_across_frames() {
+    let shapes = [
+        json!(null),
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(false),
+        json!(""),
+        json!("hi"),
+        json!({}),
+        json!([]),
+        json!([1, 2, 3]),
+        json!({"a": 1, "b": [true, null, {"c": "x"}]}),
+    ];
+
+    for v in shapes {
+        // Response::Ok — `data` is always present, any value incl. null.
+        let wire =
+            serde_json::to_string::<Frame>(&peer::response_ok(1u64, &v).unwrap().into()).unwrap();
+        match peer::parse_frame(&wire).unwrap() {
+            Frame::V1(Content::Response(Response::Ok(ok))) => {
+                assert_eq!(ok.id, 1);
+                assert_eq!(ok.result, v, "resp data mismatch for {v}");
+            }
+            other => panic!("resp wrong variant for {v}: {other:?}"),
+        }
+
+        // Stream item — seq >= 0, data present.
+        let wire = serde_json::to_string::<Frame>(&peer::stream_item(2u64, 0, &v).unwrap().into())
+            .unwrap();
+        match peer::parse_frame(&wire).unwrap() {
+            Frame::V1(Content::Stream(s)) => {
+                assert_eq!(s.seq, 0);
+                assert_eq!(s.data.as_ref().unwrap(), &v, "stream item mismatch for {v}");
+            }
+            other => panic!("stream item wrong variant for {v}: {other:?}"),
+        }
+
+        // Terminal carrying a (possibly null) bundled last item.
+        let wire = serde_json::to_string::<Frame>(
+            &peer::stream_terminal_with_data(3u64, &v).unwrap().into(),
+        )
+        .unwrap();
+        match peer::parse_frame(&wire).unwrap() {
+            Frame::V1(Content::Stream(s)) => {
+                assert!(s.is_terminal());
+                assert_eq!(
+                    s.data.as_ref().unwrap(),
+                    &v,
+                    "terminal data mismatch for {v}"
+                );
+            }
+            other => panic!("terminal wrong variant for {v}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn payload_presence_vs_absence_is_preserved() {
+    // resp: present-null ⇒ Ok; absent ⇒ rejected.
+    assert!(peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"data":null}"#).is_ok());
+    assert!(peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1}"#).is_err());
+
+    // stream terminal: absent data ⇒ None; present null ⇒ Some(null).
+    match peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":-1}"#).unwrap() {
+        Frame::V1(Content::Stream(s)) => assert!(s.data.is_none(), "absent data must be None"),
+        other => panic!("{other:?}"),
+    }
+    match peer::parse_frame(r#"{"ver":"1","kind":"stream","id":1,"seq":-1,"data":null}"#).unwrap() {
+        Frame::V1(Content::Stream(s)) => {
+            assert_eq!(
+                s.data.as_ref().unwrap(),
+                &json!(null),
+                "present null must be Some"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // notification args: absent ⇒ None; present object ⇒ Some.
+    match peer::parse_frame(r#"{"ver":"1","kind":"notif","op":"x"}"#).unwrap() {
+        Frame::V1(Content::Notification(n)) => assert!(n.args.is_none()),
+        other => panic!("{other:?}"),
+    }
+    match peer::parse_frame(r#"{"ver":"1","kind":"notif","op":"x","args":{"a":1}}"#).unwrap() {
+        Frame::V1(Content::Notification(n)) => assert!(n.args.is_some()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn error_response_id_present_and_null_round_trip() {
+    // id present.
+    let wire =
+        serde_json::to_string::<Frame>(&peer::response_err(Some(7u64), -32000, "boom").into())
+            .unwrap();
+    match peer::parse_frame(&wire).unwrap() {
+        Frame::V1(Content::Response(Response::Err(e))) => {
+            assert_eq!(e.id, Some(7));
+            assert_eq!(e.error.code, -32000);
+        }
+        other => panic!("{other:?}"),
+    }
+    // id null (parse-error reply that couldn't recover the id).
+    let wire =
+        serde_json::to_string::<Frame>(&peer::response_err(None, -32700, "bad").into()).unwrap();
+    assert!(wire.contains("\"id\":null"));
+    match peer::parse_frame(&wire).unwrap() {
+        Frame::V1(Content::Response(Response::Err(e))) => assert_eq!(e.id, None),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn response_accessors_match_variant() {
     let ok = peer::response_ok(1u64, &json!("ok")).unwrap();
