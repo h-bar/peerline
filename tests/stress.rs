@@ -5,7 +5,7 @@
 //! once: `STREAMS` streaming requests run concurrently, each handler
 //! floods `ITEMS_PER_STREAM` frames whose payload is a multi-KiB blob, so
 //! the per-stream queues, the round-robin writer, and the inbound
-//! decoder all move tens of MiB. The contract under load is unchanged —
+//! decoder all move ~160 MiB. The contract under load is unchanged —
 //! nothing is lost, nothing is reordered, every per-stream sequence stays
 //! contiguous, and the whole thing drains without deadlocking.
 //!
@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// Concurrent streams in flight.
-const STREAMS: u64 = 16;
+const STREAMS: u64 = 20;
 /// Items each stream emits before its terminal.
-const ITEMS_PER_STREAM: u64 = 200;
+const ITEMS_PER_STREAM: u64 = 1000;
 /// Payload size per item, in bytes — large enough that serialization and
 /// wire moves dominate, exercising the queues rather than the framing.
 const BLOB_BYTES: usize = 8 * 1024;
@@ -75,7 +75,7 @@ async fn concurrent_streams_large_payload_stress() {
 
             // Each stream's seq must be contiguous 0..ITEMS_PER_STREAM and
             // each payload intact, independent of how the scheduler
-            // interleaved this stream with the other fifteen.
+            // interleaved this stream with the other nineteen.
             let mut expected: u64 = 0;
             while let Some(item) = stream.next().await {
                 let item = item.expect("stream item, not an error");
