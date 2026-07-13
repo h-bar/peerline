@@ -18,7 +18,7 @@ fn stream_item_round_trips() {
     let frame = peer::stream_item(7u64, 1, &json!({"chunk": 1})).unwrap();
     assert_eq!(frame.id, 7);
     assert_eq!(frame.seq, 1);
-    assert_eq!(frame.data, Some(json!({"chunk": 1})));
+    assert_eq!(frame.data.as_ref().unwrap(), &json!({"chunk": 1}));
     assert!(frame.error.is_none());
     assert!(!frame.is_terminal());
 
@@ -35,7 +35,7 @@ fn stream_item_round_trips() {
         other => panic!("expected Stream, got {other:?}"),
     };
     assert_eq!(back.seq, 1);
-    assert_eq!(back.data, Some(json!({"chunk": 1})));
+    assert_eq!(back.data.as_ref().unwrap(), &json!({"chunk": 1}));
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn stream_terminal_empty_round_trips() {
 fn stream_terminal_with_data_round_trips() {
     let frame = peer::stream_terminal_with_data(7u64, &json!({"final": true})).unwrap();
     assert_eq!(frame.seq, STREAM_TERMINAL_SEQ);
-    assert_eq!(frame.data, Some(json!({"final": true})));
+    assert_eq!(frame.data.as_ref().unwrap(), &json!({"final": true}));
     assert!(frame.error.is_none());
     assert!(frame.is_terminal());
 
@@ -110,7 +110,7 @@ fn parse_frame_classifies_stream_item() {
     };
     assert_eq!(s.id, 1);
     assert_eq!(s.seq, 42);
-    assert_eq!(s.data, Some(json!([1, 2, 3])));
+    assert_eq!(s.data.as_ref().unwrap(), &json!([1, 2, 3]));
     assert!(s.error.is_none());
 }
 
@@ -136,7 +136,7 @@ fn parse_frame_classifies_terminal_with_data() {
         other => panic!("expected Stream, got {other:?}"),
     };
     assert!(s.is_terminal());
-    assert_eq!(s.data, Some(json!({"final": true})));
+    assert_eq!(s.data.as_ref().unwrap(), &json!({"final": true}));
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn classify_stream_yields_stream_kind() {
         InboundKind::Stream(s) => {
             assert_eq!(s.id, 1);
             assert_eq!(s.seq, 3);
-            assert_eq!(s.data, Some(json!({"k": "v"})));
+            assert_eq!(s.data.as_ref().unwrap(), &json!({"k": "v"}));
         }
         other => panic!("expected Stream, got {other:?}"),
     }
@@ -215,7 +215,7 @@ fn server_stream_lifecycle_items_then_terminal() {
                     classifications.push("item");
                 }
                 if let Some(d) = s.data {
-                    items.push(d);
+                    items.push(d.to_value().unwrap());
                 }
             }
             other => panic!("expected Stream, got {other:?}"),
@@ -234,7 +234,7 @@ fn terminal_with_bundled_last_item() {
     match peer::classify(peer::parse_frame(&wire).unwrap()) {
         InboundKind::Stream(s) => {
             assert!(s.is_terminal());
-            assert_eq!(s.data, Some(json!("last")));
+            assert_eq!(s.data.as_ref().unwrap(), &json!("last"));
         }
         other => panic!("expected Stream, got {other:?}"),
     }

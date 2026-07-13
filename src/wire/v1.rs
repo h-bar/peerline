@@ -1,15 +1,23 @@
 //! v1 wire envelope types.
 //!
-//! All v1 envelope types live here. They're keyed under [`Content`]'s
-//! `kind` tag, which is itself routed by the parent
-//! [`crate::wire::Frame`] version dispatch. Wire field names are
-//! short — at most 4 chars (`op` / `args` / `data` / `err` / `seq` /
-//! `msg`) — but readable; single-char tokens were too cryptic.
-//! Where Rust and wire names match (`op`, `args`, `id`, `seq`,
-//! `data`, `code`) no rename is needed; the rest use
-//! `#[serde(rename = "…")]`.
+//! All v1 envelope types live here. The wire frame is a flat JSON
+//! object tagged by `ver` (version) and `kind` (envelope shape). Rather
+//! than let serde's derived internally-tagged / untagged enum machinery
+//! drive the dispatch — which buffers the whole frame into an
+//! intermediate representation on every parse and, fatally, cannot
+//! capture payloads as [`serde_json::value::RawValue`] — the frame's
+//! [`Serialize`] / [`Deserialize`] are hand-written (see [`crate::wire`]).
+//! Deserialization funnels through the flat [`WireV1`] view, whose
+//! `args` / `data` fields are captured raw and only parsed at the typed
+//! boundary; [`content_from_wire`] then validates per-`kind` and builds
+//! the typed [`Content`].
+//!
+//! Wire field names are short — at most 4 chars (`op` / `args` / `data`
+//! / `err` / `seq` / `msg`) — but readable.
 
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -81,28 +89,100 @@ pub type Id = u64;
 pub type Params = Map<String, Value>;
 
 // ---------------------------------------------------------------------------
-// Content — the kind-dispatch enum, keyed on `t`
+// RawJson — payload kept in raw serialized form
 // ---------------------------------------------------------------------------
 
-/// One v1 frame body, discriminated by the `kind` field on the wire.
-/// Rust variant names match today's [`Request`] / [`Response`] /
-/// [`Notification`] / [`StreamFrame`] envelopes so pattern-match
-/// call sites don't churn; per-variant `#[serde(rename)]` gives the
-/// compact wire tag values (`"req"`, `"resp"`, `"notif"`, `"stream"`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+/// A JSON payload retained in its raw serialized form.
+///
+/// Envelope payload fields — `data` on [`StreamFrame`], `result` on
+/// [`ResponseOk`] — hold one of these instead of a fully-parsed
+/// [`serde_json::Value`]. On the send path the payload is serialized
+/// straight to bytes once (no intermediate `Value` tree); on the receive
+/// path [`crate::peer::parse_frame`] captures the raw slice without
+/// walking it, deferring the single deserialize to the typed consumer via
+/// [`Self::deserialize`]. This halves the serde work for large payloads.
+///
+/// On the wire a `RawJson` is indistinguishable from the equivalent
+/// `Value` — it serializes and parses as the same JSON bytes.
+#[derive(Debug, Clone)]
+pub struct RawJson(Box<RawValue>);
+
+impl RawJson {
+    /// Serialize `value` directly into raw JSON in a single pass — no
+    /// intermediate [`serde_json::Value`].
+    pub fn from_serialize<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
+        serde_json::value::to_raw_value(value).map(RawJson)
+    }
+
+    /// Wrap an already-captured raw JSON slice.
+    #[must_use]
+    pub(crate) fn from_raw(raw: Box<RawValue>) -> Self {
+        RawJson(raw)
+    }
+
+    /// The underlying raw JSON text.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        self.0.get()
+    }
+
+    /// Deserialize the raw JSON into `T` in a single pass.
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_str(self.0.get())
+    }
+
+    /// Parse the payload into a navigable [`serde_json::Value`]. Prefer
+    /// [`Self::deserialize`] for typed access; this is for callers that
+    /// want a dynamic tree.
+    pub fn to_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::from_str(self.0.get())
+    }
+}
+
+impl Serialize for RawJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // `RawValue`'s own Serialize emits the captured bytes verbatim
+        // under serde_json.
+        self.0.serialize(serializer)
+    }
+}
+
+impl PartialEq for RawJson {
+    /// Semantic JSON equality: compares the parsed values, so whitespace
+    /// / key-order differences between two encodings of the same payload
+    /// don't matter. Falls back to raw-text equality if either side
+    /// isn't valid JSON (never happens for well-formed frames).
+    fn eq(&self, other: &Self) -> bool {
+        match (self.to_value(), other.to_value()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => self.get() == other.get(),
+        }
+    }
+}
+
+impl PartialEq<Value> for RawJson {
+    fn eq(&self, other: &Value) -> bool {
+        matches!(self.to_value(), Ok(ref v) if v == other)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content — the kind-dispatch enum (built by the frame's manual Deserialize)
+// ---------------------------------------------------------------------------
+
+/// One v1 frame body. On the wire it is discriminated by the `kind`
+/// field; in Rust it's the product of [`crate::wire::Frame`]'s
+/// hand-written (de)serialization, so this enum carries no serde
+/// attributes of its own.
+#[derive(Debug, Clone)]
 pub enum Content {
     /// A call expecting a reply.
-    #[serde(rename = "req")]
     Request(Request),
     /// A reply to a [`Request`].
-    #[serde(rename = "resp")]
     Response(Response),
     /// A one-way call (no reply expected).
-    #[serde(rename = "notif")]
     Notification(Notification),
     /// A streaming-lifecycle frame.
-    #[serde(rename = "stream")]
     Stream(StreamFrame),
 }
 
@@ -114,15 +194,13 @@ pub enum Content {
 /// For one-way calls, use [`Notification`] instead — they're distinct
 /// Rust types so direction-typed dispatch is enforced by the type
 /// system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Request {
     /// Caller-chosen request id — required.
     pub id: Id,
     /// The operation being invoked.
     pub op: String,
-    /// Operation arguments — must be a JSON Object when present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Operation arguments — a JSON Object when present.
     pub args: Option<Params>,
 }
 
@@ -131,15 +209,11 @@ pub struct Request {
 // ---------------------------------------------------------------------------
 
 /// A reply to a [`Request`]. The result/error mutual exclusion is
-/// enforced **at the type level**: this is a `Result`-shaped enum,
-/// so a single response can only be one or the other.
-///
-/// `#[serde(untagged)]` keeps the variants invisible on the wire:
-/// the presence of `data` vs `err` discriminates. Both inner structs use
-/// `deny_unknown_fields` so a frame that has both — or neither — fails
-/// to deserialize.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+/// enforced **at the type level**: this is a `Result`-shaped enum, so a
+/// single response can only be one or the other. On the wire the
+/// presence of `data` vs `err` discriminates; the frame deserializer
+/// rejects a `resp` frame carrying both or neither.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     /// Successful invocation — carries the `data` (result) value.
     Ok(ResponseOk),
@@ -148,28 +222,24 @@ pub enum Response {
 }
 
 /// Body of a successful [`Response`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResponseOk {
     /// Echoes the request's `id`. Non-null — successful responses
     /// always know the id.
     pub id: Id,
-    /// Success payload.
-    #[serde(rename = "data")]
-    pub result: Value,
+    /// Success payload, kept raw (wire field `data`).
+    pub result: RawJson,
 }
 
 /// Body of an error [`Response`]. `id` is `Option<Id>` — `None` ⇒
 /// JSON `null` on the wire, used only when the responder couldn't
 /// recover the request id from a malformed frame.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResponseErr {
     /// Echoes the request's `id`, or `null` if the request was so
     /// malformed the id couldn't be recovered.
     pub id: Option<Id>,
-    /// Error payload.
-    #[serde(rename = "err")]
+    /// Error payload (wire field `err`).
     pub error: RpcError,
 }
 
@@ -188,7 +258,7 @@ impl Response {
 
     /// `Some(&result)` iff this is an [`Response::Ok`].
     #[must_use]
-    pub fn result(&self) -> Option<&Value> {
+    pub fn result(&self) -> Option<&RawJson> {
         match self {
             Response::Ok(r) => Some(&r.result),
             Response::Err(_) => None,
@@ -216,8 +286,9 @@ impl Response {
         matches!(self, Response::Err(_))
     }
 
-    /// Consume the response into a Rust [`Result`].
-    pub fn into_outcome(self) -> Result<Value, RpcError> {
+    /// Consume the response into a Rust [`Result`]. The success payload
+    /// is returned raw — deserialize it with [`RawJson::deserialize`].
+    pub fn into_outcome(self) -> Result<RawJson, RpcError> {
         match self {
             Response::Ok(r) => Ok(r.result),
             Response::Err(r) => Err(r.error),
@@ -232,13 +303,11 @@ impl Response {
 /// A one-way call without an id — no reply expected, the other peer
 /// MUST NOT send one. A separate Rust type from [`Request`] so the
 /// type system enforces "Notifications don't get responses."
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Notification {
     /// The operation name.
     pub op: String,
-    /// Notification arguments — must be a JSON Object when present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Notification arguments — a JSON Object when present.
     pub args: Option<Params>,
 }
 
@@ -248,13 +317,16 @@ pub struct Notification {
 
 /// Error object — body of [`Response::Err`] and the `error` field of
 /// a terminal [`StreamFrame`]. Wire field names: `code` / `msg` /
-/// `data` — kept ≤ 4 chars like the envelope fields.
+/// `data` — kept ≤ 4 chars like the envelope fields. This one keeps its
+/// derived serde impls: it is small, carries no large payload, and is
+/// (de)serialized as a plain nested object (never a tagged-enum
+/// discriminant), so `RawValue` capture doesn't apply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcError {
     /// The raw integer code. Peerline-internal protocol errors use the
     /// reserved negative range (`-32600`..=`-32603`); applications are
     /// free to pick any other value. Prefer the typed view via
-    /// [`Self::kind`] for pattern-matching.
+    /// [`Self::error_type`] for pattern-matching.
     pub code: i32,
     /// Human-readable error message.
     #[serde(rename = "msg")]
@@ -306,8 +378,7 @@ impl RpcError {
 ///
 /// There is no separate Open / Close / Cancel frame. The first
 /// `seq=0` Item implicitly opens the stream. A `seq=-1` frame ends it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamFrame {
     /// Correlates to the originating [`Request`].
     pub id: Id,
@@ -317,15 +388,13 @@ pub struct StreamFrame {
     /// dropped items). `-1` marks the terminal frame. Values
     /// `<= -2` are reserved.
     pub seq: i64,
-    /// Stream element payload — typed by the consumer. Present on
-    /// regular items; optional on the terminal frame (a `seq=-1`
-    /// frame may bundle the last data item).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
+    /// Stream element payload, kept raw — typed by the consumer.
+    /// Present on regular items; optional on the terminal frame (a
+    /// `seq=-1` frame may bundle the last data item).
+    pub data: Option<RawJson>,
     /// Optional error payload. Presence on any frame signals that the
     /// stream ended in error — receivers treat the frame as terminal
     /// regardless of `seq`.
-    #[serde(rename = "err", default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
 }
 
@@ -346,3 +415,154 @@ impl StreamFrame {
 
 /// The sentinel `seq` value that marks the terminal frame.
 pub const STREAM_TERMINAL_SEQ: i64 = -1;
+
+// ---------------------------------------------------------------------------
+// WireV1 — the flat deserialize view + typed mapping
+// ---------------------------------------------------------------------------
+
+/// The four envelope shapes, keyed on the wire `kind` tag. A plain
+/// externally-tagged unit enum — deserializes straight from the tag
+/// string, rejecting anything else.
+#[derive(Deserialize)]
+enum WireKind {
+    #[serde(rename = "req")]
+    Request,
+    #[serde(rename = "resp")]
+    Response,
+    #[serde(rename = "notif")]
+    Notification,
+    #[serde(rename = "stream")]
+    Stream,
+}
+
+/// Flat wire view of a v1 frame: every field any envelope can carry,
+/// with `args` / `data` captured raw. This is a plain struct (not a
+/// tagged enum), so serde_json records the raw payload slices without
+/// buffering the frame into an intermediate `Value`. [`content_from_wire`]
+/// validates per-`kind` and moves the fields into the typed [`Content`].
+///
+/// `deny_unknown_fields` rejects stray keys; per-`kind` field
+/// requirements (which fields are mandatory / forbidden for each shape)
+/// are enforced in [`content_from_wire`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireV1 {
+    ver: String,
+    kind: WireKind,
+    /// `None` ⇒ key absent; `Some(None)` ⇒ explicit `null`;
+    /// `Some(Some(n))` ⇒ a number. The distinction matters: an error
+    /// response may carry `id: null`, but absent-vs-null-vs-number is
+    /// validated per kind.
+    #[serde(default, deserialize_with = "double_option")]
+    id: Option<Option<Id>>,
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    seq: Option<i64>,
+    #[serde(default)]
+    args: Option<Box<RawValue>>,
+    #[serde(default)]
+    data: Option<Box<RawValue>>,
+    #[serde(default)]
+    err: Option<RpcError>,
+}
+
+/// `deserialize_with` helper that distinguishes an absent key (serde's
+/// `default` → `None`) from a present `null` (`Some(None)`).
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
+/// Map a validated [`WireV1`] into the typed [`Content`], enforcing the
+/// per-`kind` field contract. Returns a message on any violation
+/// (unknown version, missing/forbidden field, non-object args, a `resp`
+/// carrying both or neither of `data`/`err`); [`crate::wire::Frame`]'s
+/// `Deserialize` turns it into a serde error.
+pub(crate) fn content_from_wire(w: WireV1) -> Result<Content, String> {
+    if w.ver != "1" {
+        return Err(format!("unsupported wire version {:?}", w.ver));
+    }
+    match w.kind {
+        WireKind::Request => {
+            if w.seq.is_some() || w.data.is_some() || w.err.is_some() {
+                return Err("request must not carry seq/data/err".to_owned());
+            }
+            let id =
+                w.id.flatten()
+                    .ok_or_else(|| "request requires a numeric id".to_owned())?;
+            let op = w.op.ok_or_else(|| "request requires op".to_owned())?;
+            let args = w.args.as_deref().map(raw_to_params).transpose()?;
+            Ok(Content::Request(Request { id, op, args }))
+        }
+        WireKind::Notification => {
+            if w.id.is_some() {
+                return Err("notification must not carry id".to_owned());
+            }
+            if w.seq.is_some() || w.data.is_some() || w.err.is_some() {
+                return Err("notification must not carry seq/data/err".to_owned());
+            }
+            let op = w.op.ok_or_else(|| "notification requires op".to_owned())?;
+            let args = w.args.as_deref().map(raw_to_params).transpose()?;
+            Ok(Content::Notification(Notification { op, args }))
+        }
+        WireKind::Response => {
+            if w.op.is_some() || w.seq.is_some() || w.args.is_some() {
+                return Err("response must not carry op/seq/args".to_owned());
+            }
+            match (w.data, w.err) {
+                (Some(_), Some(_)) => Err("response carries both data and err".to_owned()),
+                (None, None) => Err("response carries neither data nor err".to_owned()),
+                (Some(data), None) => {
+                    let id =
+                        w.id.flatten()
+                            .ok_or_else(|| "ok response requires a numeric id".to_owned())?;
+                    Ok(Content::Response(Response::Ok(ResponseOk {
+                        id,
+                        result: RawJson::from_raw(data),
+                    })))
+                }
+                (None, Some(err)) => {
+                    // The `id` key must be present (numeric or explicit
+                    // null); absent is rejected. `null` ⇒ id `None`.
+                    let id =
+                        w.id.ok_or_else(|| "error response requires an id field".to_owned())?;
+                    Ok(Content::Response(Response::Err(ResponseErr {
+                        id,
+                        error: err,
+                    })))
+                }
+            }
+        }
+        WireKind::Stream => {
+            if w.op.is_some() || w.args.is_some() {
+                return Err("stream frame must not carry op/args".to_owned());
+            }
+            let id =
+                w.id.flatten()
+                    .ok_or_else(|| "stream frame requires a numeric id".to_owned())?;
+            let seq = w
+                .seq
+                .ok_or_else(|| "stream frame requires seq".to_owned())?;
+            Ok(Content::Stream(StreamFrame {
+                id,
+                seq,
+                data: w.data.map(RawJson::from_raw),
+                error: w.err,
+            }))
+        }
+    }
+}
+
+/// Parse a raw `args` payload into typed [`Params`], requiring a JSON
+/// Object (peerline doesn't support positional params).
+fn raw_to_params(raw: &RawValue) -> Result<Params, String> {
+    match serde_json::from_str::<Value>(raw.get()) {
+        Ok(Value::Object(o)) => Ok(o),
+        Ok(_) => Err("args must be a JSON object".to_owned()),
+        Err(e) => Err(e.to_string()),
+    }
+}

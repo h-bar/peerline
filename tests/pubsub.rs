@@ -95,7 +95,7 @@ fn subscription_ack_round_trips_inside_response_ok() {
     let ack = pubsub::subscription_ack("sub-42");
     let resp = peer::response_ok(1u64, &ack).unwrap();
     let result_value = resp.result().expect("ok response carries result");
-    let parsed: pubsub::SubscriptionAck = serde_json::from_value(result_value.clone()).unwrap();
+    let parsed: pubsub::SubscriptionAck = result_value.deserialize().unwrap();
     assert_eq!(parsed.subscription_id, "sub-42");
 }
 

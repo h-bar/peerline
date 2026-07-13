@@ -16,7 +16,7 @@ use super::stream::{StreamReceiver, StreamSender};
 use crate::peer as p;
 use crate::peer::{InboundKind, RequestIdGen};
 use crate::wire::{
-    ErrorType, Frame, Id, Notification, Params, Request, Response, RpcError, StreamFrame,
+    ErrorType, Frame, Id, Notification, Params, RawJson, Request, Response, RpcError, StreamFrame,
 };
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
@@ -31,11 +31,8 @@ use std::sync::{Arc, Mutex};
 // Handler types — boxed async closures registered by method name
 // ---------------------------------------------------------------------------
 
-type RequestHandler = Arc<
-    dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, RpcError>>
-        + Send
-        + Sync,
->;
+type RequestHandler =
+    Arc<dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<RawJson, RpcError>> + Send + Sync>;
 
 type NotificationHandler = Arc<dyn Fn(serde_json::Value) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -52,7 +49,7 @@ type StreamHandler =
 /// wrappers — so a Peer clone is just an `Arc::clone`.
 pub(crate) struct PeerInner {
     ids: RequestIdGen,
-    pub(crate) pending: Mutex<HashMap<Id, oneshot::Sender<Result<serde_json::Value, RpcError>>>>,
+    pub(crate) pending: Mutex<HashMap<Id, oneshot::Sender<Result<RawJson, RpcError>>>>,
     pub(crate) streams: Mutex<HashMap<Id, mpsc::UnboundedSender<StreamFrame>>>,
     request_handlers: Mutex<HashMap<String, RequestHandler>>,
     notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
@@ -236,7 +233,7 @@ impl Peer {
         send_frame(&self.inner, req)?;
 
         match rx.await {
-            Ok(Ok(value)) => Ok(serde_json::from_value(value)?),
+            Ok(Ok(raw)) => Ok(raw.deserialize()?),
             Ok(Err(rpc_err)) => Err(Error::Rpc(rpc_err)),
             Err(_) => {
                 self.inner.pending.lock().unwrap().remove(&id);
@@ -291,7 +288,7 @@ impl Peer {
                     data: None,
                 })?;
                 let r = f(a).await?;
-                serde_json::to_value(r).map_err(|e| RpcError {
+                RawJson::from_serialize(&r).map_err(|e| RpcError {
                     code: ErrorType::Internal.into(),
                     message: e.to_string(),
                     data: None,
@@ -530,7 +527,7 @@ async fn process_request(inner: Arc<PeerInner>, req: Request) -> Option<Response
     let unary_handler = inner.request_handlers.lock().unwrap().get(&req.op).cloned();
     let response = match unary_handler {
         Some(handler) => match handler(args_value).await {
-            Ok(value) => p::response_ok_value(id, value),
+            Ok(raw) => p::response_ok_raw(id, raw),
             Err(rpc_err) => p::response_err(Some(id), rpc_err.code, rpc_err.message),
         },
         None => p::response_err(

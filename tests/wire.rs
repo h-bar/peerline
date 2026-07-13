@@ -23,7 +23,7 @@ fn request_frame_round_trip() {
 
 #[test]
 fn response_ok_frame_round_trip() {
-    let resp = peer::response_ok_value(1u64, json!(42));
+    let resp = peer::response_ok(1u64, &json!(42)).unwrap();
     let frame: Frame = resp.into();
     let s = serde_json::to_string(&frame).unwrap();
     assert!(s.contains("\"ver\":\"1\""));
@@ -90,9 +90,9 @@ fn response_rejects_neither_result_nor_error() {
 
 #[test]
 fn response_accessors_match_variant() {
-    let ok = peer::response_ok_value(1u64, json!("ok"));
+    let ok = peer::response_ok(1u64, &json!("ok")).unwrap();
     assert!(ok.is_ok());
-    assert_eq!(ok.result(), Some(&json!("ok")));
+    assert_eq!(ok.result().unwrap(), &json!("ok"));
     assert_eq!(ok.error(), None);
     assert_eq!(ok.id(), Some(&1u64));
 
@@ -106,8 +106,11 @@ fn response_accessors_match_variant() {
 #[test]
 fn response_into_outcome_collapses_to_result() {
     assert_eq!(
-        peer::response_ok_value(1u64, json!(42)).into_outcome(),
-        Ok(json!(42))
+        peer::response_ok(1u64, &json!(42))
+            .unwrap()
+            .into_outcome()
+            .unwrap(),
+        json!(42)
     );
     match peer::response_err(Some(2u64), -32000, "nope").into_outcome() {
         Err(e) => assert_eq!(e.code, -32000),
@@ -259,7 +262,7 @@ fn peer_builders_compose_into_round_trip() {
         _ => panic!("expected IncomingRequest"),
     };
     assert_eq!(inbound.op, "add");
-    let reply = peer::response_ok_value(inbound.id, json!(3));
+    let reply = peer::response_ok(inbound.id, &json!(3)).unwrap();
     let reply_wire = serde_json::to_string::<Frame>(&reply.into()).unwrap();
 
     // peer A

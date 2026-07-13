@@ -290,9 +290,10 @@ impl<R: DeserializeOwned + Unpin> Stream for StreamReceiver<R> {
                         return Poll::Ready(Some(Err(Error::Rpc(error))));
                     }
                     // If the frame carries data, yield it. The terminal
-                    // frame may carry a bundled last item.
+                    // frame may carry a bundled last item. The payload was
+                    // captured raw on the wire; deserialize it once here.
                     if let Some(data) = frame.data {
-                        let item = match serde_json::from_value(data) {
+                        let item = match data.deserialize() {
                             Ok(d) => StreamItem {
                                 seq: frame.seq,
                                 data: d,

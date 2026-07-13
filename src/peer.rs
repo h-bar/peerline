@@ -41,7 +41,7 @@
 //! ```
 
 use crate::wire::{
-    Content, ErrorType, Frame, Id, Notification, Params, Request, Response, ResponseErr,
+    Content, ErrorType, Frame, Id, Notification, Params, RawJson, Request, Response, ResponseErr,
     ResponseOk, RpcError, STREAM_TERMINAL_SEQ, StreamFrame,
 };
 use serde::Serialize;
@@ -64,8 +64,10 @@ pub enum InboundKind {
         /// carried JSON `null` (a parse-error reply for which the
         /// responder couldn't recover the id).
         id: Option<Id>,
-        /// `Ok(result)` on success, `Err(rpc_error)` on failure.
-        outcome: Result<Value, RpcError>,
+        /// `Ok(result)` on success, `Err(rpc_error)` on failure. The
+        /// success payload is raw — deserialize it with
+        /// [`RawJson::deserialize`].
+        outcome: Result<RawJson, RpcError>,
     },
     /// A request initiated by the other peer — handle it and send
     /// a [`Response`].
@@ -196,14 +198,15 @@ pub fn response_ok<T: Serialize>(
 ) -> Result<Response, serde_json::Error> {
     Ok(Response::Ok(ResponseOk {
         id: id.into(),
-        result: serde_json::to_value(result)?,
+        result: RawJson::from_serialize(result)?,
     }))
 }
 
-/// Build a success [`Response`] whose `result` is already a
-/// [`serde_json::Value`].
+/// Build a success [`Response`] whose `result` is already serialized
+/// into a [`RawJson`]. Lets the runtime forward a handler's result
+/// without a `Value` round-trip.
 #[must_use]
-pub fn response_ok_value(id: impl Into<Id>, result: Value) -> Response {
+pub fn response_ok_raw(id: impl Into<Id>, result: RawJson) -> Response {
     Response::Ok(ResponseOk {
         id: id.into(),
         result,
@@ -298,7 +301,7 @@ pub fn stream_item<T: Serialize>(
     Ok(StreamFrame {
         id: id.into(),
         seq: seq as i64,
-        data: Some(serde_json::to_value(data)?),
+        data: Some(RawJson::from_serialize(data)?),
         error: None,
     })
 }
@@ -325,7 +328,7 @@ pub fn stream_terminal_with_data<T: Serialize>(
     Ok(StreamFrame {
         id: id.into(),
         seq: STREAM_TERMINAL_SEQ,
-        data: Some(serde_json::to_value(data)?),
+        data: Some(RawJson::from_serialize(data)?),
         error: None,
     })
 }

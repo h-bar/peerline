@@ -38,21 +38,85 @@
 pub mod v1;
 
 pub use v1::{
-    Content, ErrorType, Id, Notification, Params, Request, Response, ResponseErr, ResponseOk,
-    RpcError, STREAM_TERMINAL_SEQ, StreamFrame,
+    Content, ErrorType, Id, Notification, Params, RawJson, Request, Response, ResponseErr,
+    ResponseOk, RpcError, STREAM_TERMINAL_SEQ, StreamFrame,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Outer wire envelope — version-tagged. Today only v1 exists; future
 /// wire versions land as additional variants (`V2(v2::Content)` etc.)
-/// in this enum without touching v1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "ver")]
+/// in this enum.
+///
+/// [`Serialize`] / [`Deserialize`] are hand-written rather than derived:
+/// serde's internally-tagged (`ver` / `kind`) and untagged
+/// (`Response`) machinery buffers the whole frame into an intermediate
+/// representation on every parse and cannot capture payloads as
+/// [`serde_json::value::RawValue`]. The manual impls dispatch on the
+/// tags directly and funnel deserialization through the flat
+/// [`v1::WireV1`] view, so `args` / `data` payloads are captured raw and
+/// parsed once, at the typed boundary.
+#[derive(Debug, Clone)]
 pub enum Frame {
     /// v1 frame (the current and only version).
-    #[serde(rename = "1")]
     V1(v1::Content),
+}
+
+impl Serialize for Frame {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Frame::V1(content) = self;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("ver", "1")?;
+        match content {
+            Content::Request(r) => {
+                map.serialize_entry("kind", "req")?;
+                map.serialize_entry("id", &r.id)?;
+                map.serialize_entry("op", &r.op)?;
+                if let Some(args) = &r.args {
+                    map.serialize_entry("args", args)?;
+                }
+            }
+            Content::Response(Response::Ok(r)) => {
+                map.serialize_entry("kind", "resp")?;
+                map.serialize_entry("id", &r.id)?;
+                map.serialize_entry("data", &r.result)?;
+            }
+            Content::Response(Response::Err(r)) => {
+                map.serialize_entry("kind", "resp")?;
+                // Emitted even when `None` → `id: null` on the wire.
+                map.serialize_entry("id", &r.id)?;
+                map.serialize_entry("err", &r.error)?;
+            }
+            Content::Notification(n) => {
+                map.serialize_entry("kind", "notif")?;
+                map.serialize_entry("op", &n.op)?;
+                if let Some(args) = &n.args {
+                    map.serialize_entry("args", args)?;
+                }
+            }
+            Content::Stream(s) => {
+                map.serialize_entry("kind", "stream")?;
+                map.serialize_entry("id", &s.id)?;
+                map.serialize_entry("seq", &s.seq)?;
+                if let Some(data) = &s.data {
+                    map.serialize_entry("data", data)?;
+                }
+                if let Some(err) = &s.error {
+                    map.serialize_entry("err", err)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Frame {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = v1::WireV1::deserialize(deserializer)?;
+        let content = v1::content_from_wire(wire).map_err(serde::de::Error::custom)?;
+        Ok(Frame::V1(content))
+    }
 }
 
 impl Frame {

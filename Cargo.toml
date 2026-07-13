@@ -15,7 +15,7 @@ runtime = ["dep:futures", "dep:thiserror"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 # futures::channel (mpsc/oneshot) + FuturesUnordered let us run
 # handlers concurrently without needing a runtime's spawn primitive.
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
