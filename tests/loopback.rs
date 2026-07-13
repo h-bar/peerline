@@ -292,3 +292,57 @@ async fn either_peer_can_initiate_a_call() {
     assert_eq!(from_a, "hello-b");
     assert_eq!(from_b, "hello-a");
 }
+
+// ---------------------------------------------------------------------------
+// Regression — null-serializing payloads (0.0.3 RawValue deadlock)
+// ---------------------------------------------------------------------------
+
+// A response whose payload serializes to JSON `null` (`call::<_, ()>` and
+// any handler returning `()` / `None`) must round-trip. The 0.0.3
+// hand-written RawValue codec collapsed a present `"data": null` to "no
+// data", rejected the response frame, and the caller's waiter hung forever.
+#[tokio::test]
+async fn call_with_unit_response_does_not_hang() {
+    let (a, b) = wire_loopback();
+    b.on_request("noop", |_: serde_json::Value| async {
+        Ok::<(), RpcError>(())
+    });
+
+    let args = json!({});
+    let out = tokio::time::timeout(Duration::from_secs(2), a.call::<_, ()>("noop", &args))
+        .await
+        .expect("call::<_, ()> must not hang — unit/null response must match its waiter");
+    out.expect("unit call should succeed");
+}
+
+// The same null-payload hazard on the stream path: items whose payload
+// serializes to `null` must be delivered (not silently swallowed), and the
+// stream must still close gracefully — a call + stream-close round-trip.
+#[tokio::test]
+async fn stream_delivers_null_payload_items_then_closes() {
+    let (a, b) = wire_loopback();
+    b.on_stream_request("nulls", |_: serde_json::Value, sender| async move {
+        sender.send_item(&()).unwrap(); // → "data": null
+        sender.send_item(&Option::<u32>::None).unwrap(); // → "data": null
+        Ok::<_, RpcError>(())
+    });
+
+    let args = json!({});
+    let mut stream: runtime::StreamReceiver<serde_json::Value> =
+        a.call_stream("nulls", &args).unwrap();
+
+    let mut items = Vec::new();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("stream must not hang")
+    {
+        items.push(item.expect("stream item"));
+    }
+
+    assert_eq!(items.len(), 2, "both null-payload items must be delivered");
+    assert!(
+        items.iter().all(|i| i.data.is_null()),
+        "payloads should decode as JSON null"
+    );
+    assert_eq!(items.iter().map(|i| i.seq).collect::<Vec<_>>(), vec![0, 1]);
+}

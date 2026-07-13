@@ -89,6 +89,24 @@ fn response_rejects_neither_result_nor_error() {
 }
 
 #[test]
+fn response_with_null_data_parses_as_ok() {
+    // Regression (0.0.3 deadlock): `"data": null` is a *present* null
+    // payload — exactly what a `call::<_, ()>` reply serializes to — not an
+    // absent field. The hand-written RawValue codec must keep it as Some,
+    // or the frame gets rejected as "neither data nor err" and the caller's
+    // waiter hangs forever. (Absent `data` — see the test above — is still
+    // correctly rejected.)
+    let frame = peer::parse_frame(r#"{"ver":"1","kind":"resp","id":1,"data":null}"#).unwrap();
+    match frame {
+        Frame::V1(Content::Response(Response::Ok(ok))) => {
+            assert_eq!(ok.id, 1);
+            assert_eq!(ok.result.get(), "null");
+        }
+        other => panic!("expected an Ok response, got {other:?}"),
+    }
+}
+
+#[test]
 fn response_accessors_match_variant() {
     let ok = peer::response_ok(1u64, &json!("ok")).unwrap();
     assert!(ok.is_ok());

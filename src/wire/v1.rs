@@ -461,10 +461,29 @@ pub(crate) struct WireV1 {
     seq: Option<i64>,
     #[serde(default)]
     args: Option<Box<RawValue>>,
-    #[serde(default)]
+    // NB: `present_raw`, not a plain `Option<Box<RawValue>>` — a present
+    // `"data": null` (e.g. a `call::<_, ()>` reply, whose payload
+    // serializes to `null`) must stay `Some(RawValue("null"))`. A plain
+    // `Option` collapses JSON `null` to `None`, which would make a valid
+    // Ok response look like it carries neither `data` nor `err` and get
+    // rejected — deadlocking the caller's waiter. `#[serde(default)]` still
+    // yields `None` for an absent key.
+    #[serde(default, deserialize_with = "present_raw")]
     data: Option<Box<RawValue>>,
     #[serde(default)]
     err: Option<RpcError>,
+}
+
+/// Capture a *present* field as raw JSON even when its value is `null`,
+/// so `"data": null` becomes `Some(RawValue("null"))` instead of the
+/// `None` a plain `Option<Box<RawValue>>` would produce. Paired with
+/// `#[serde(default)]`, an *absent* key is still `None` — this only runs
+/// when the key is present.
+fn present_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Box::<RawValue>::deserialize(deserializer).map(Some)
 }
 
 /// `deserialize_with` helper that distinguishes an absent key (serde's
