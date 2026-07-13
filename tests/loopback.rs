@@ -132,30 +132,44 @@ async fn notify_delivers_to_handler_without_reply() {
 async fn handlers_run_concurrently() {
     let (a, b) = wire_loopback();
 
-    b.on_request("slow", |_: serde_json::Value| async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        Ok::<_, RpcError>("slow-done")
+    // A 2-party barrier only releases once BOTH handlers are awaiting it
+    // at the same time. If the dispatch loop ran handlers sequentially,
+    // the first would block on the barrier forever and the outer timeout
+    // would fire. This proves real overlap structurally — no dependence
+    // on wall-clock sleep precision (a fixed time threshold is flaky
+    // because tokio's timer can stretch a 100ms sleep well past that).
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let barrier_a = barrier.clone();
+    b.on_request("task_a", move |_: serde_json::Value| {
+        let barrier = barrier_a.clone();
+        async move {
+            barrier.wait().await;
+            Ok::<_, RpcError>("a-done")
+        }
     });
-    b.on_request("fast", |_: serde_json::Value| async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        Ok::<_, RpcError>("fast-done")
+    let barrier_b = barrier.clone();
+    b.on_request("task_b", move |_: serde_json::Value| {
+        let barrier = barrier_b.clone();
+        async move {
+            barrier.wait().await;
+            Ok::<_, RpcError>("b-done")
+        }
     });
 
     let empty1 = json!({});
     let empty2 = json!({});
-    let start = std::time::Instant::now();
-    let (slow, fast) = tokio::join!(
-        a.call::<_, String>("slow", &empty1),
-        a.call::<_, String>("fast", &empty2),
-    );
-    let elapsed = start.elapsed();
+    let (a_res, b_res) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            a.call::<_, String>("task_a", &empty1),
+            a.call::<_, String>("task_b", &empty2),
+        )
+    })
+    .await
+    .expect("handlers ran sequentially: barrier never released");
 
-    assert_eq!(slow.unwrap(), "slow-done");
-    assert_eq!(fast.unwrap(), "fast-done");
-    assert!(
-        elapsed < Duration::from_millis(150),
-        "handlers ran sequentially: {elapsed:?}"
-    );
+    assert_eq!(a_res.unwrap(), "a-done");
+    assert_eq!(b_res.unwrap(), "b-done");
 }
 
 // ---------------------------------------------------------------------------
