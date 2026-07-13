@@ -97,6 +97,17 @@ pub mod peer;
 pub mod pubsub;
 pub mod wire;
 
+/// Recommended maximum size, in bytes, of a single text frame carrying
+/// one peerline [`wire::Frame`].
+///
+/// Byte-level framing is a transport concern (see the module docs), but
+/// the size *ceiling* is shared policy: every transport that carries
+/// peerline frames should pin its codec to this one value rather than
+/// inheriting a per-library default, so they behave alike and a peer
+/// cannot make any decoder buffer more than this before a frame
+/// completes. 64 MiB matches tungstenite's default message ceiling.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// Stateful runtime [`Peer`](runtime::Peer) — call / notify /
 /// stream / handler registry. Opt in via the `runtime` feature.
 #[cfg(feature = "runtime")]
