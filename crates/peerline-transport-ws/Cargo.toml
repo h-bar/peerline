@@ -1,0 +1,15 @@
+[package]
+name = "peerline-transport-ws"
+description = "WebSocket transport for peerline (axum) — a self-contained accept-loop (`serve`) that binds an address, upgrades browser clients, and drives a peerline `Peer` per connection. axum is fully encapsulated: callers pass an address + handler closure, no axum types cross the boundary."
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.7", features = ["cors"] }
+futures = "0.3"
+tokio = { version = "1", features = ["net", "rt"] }
+tracing = "0.1"
+# `Peer` (one per connection) + the canonical frame-size ceiling.
+peerline = { path = "../..", features = ["runtime"] }

@@ -1,3 +1,16 @@
+# This manifest is both the `peerline` package and the workspace root.
+# The transport crates (`peerline-transport-{iroh,ws,uds}`) are members;
+# `tauri-plugin-peerline-iroh` (the dial plugin) is EXCLUDED — it carries
+# its own `[workspace]` so `tauri` stays out of peerline's default build.
+[workspace]
+members = [
+    "crates/peerline-transport-iroh",
+    "crates/peerline-transport-ws",
+    "crates/peerline-transport-uds",
+]
+exclude = ["crates/tauri-plugin-peerline-iroh"]
+resolver = "2"
+
 [package]
 name = "peerline"
 description = "Peer-symmetric bidirectional RPC toolkit — typed request/response/notification/stream envelopes with a pubsub layer, version-tagged JSON wire format, plus an optional stateful Peer runtime"

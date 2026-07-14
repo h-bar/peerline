@@ -1,0 +1,24 @@
+[package]
+name = "peerline-transport-iroh"
+description = "Iroh P2P (QUIC) transport for peerline — ticket codec, text framing, and a reusable accept-loop (`serve`) that drives a peerline `Peer` per bi-stream. Pairs with the tauri-plugin-peerline-iroh dial side; the ALPN is caller-supplied so one host can run several peerline services."
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+# `iroh` drives the endpoint / accept loop; `iroh-base` supplies the
+# `SecretKey` + `EndpointAddr` the ticket encodes. Keep the major pinned
+# so the serialization stays compatible across both ends; the `key`
+# feature gates those types.
+iroh = "1"
+iroh-base = { version = "1", features = ["key"] }
+data-encoding = "2"
+postcard = { version = "1", features = ["use-std"] }
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["io-util", "rt"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+# `Peer` (the accept loop drives one per bi-stream) + the canonical
+# frame-size ceiling ([`peerline::MAX_FRAME_LEN`]).
+peerline = { path = "../..", features = ["runtime"] }
