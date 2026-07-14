@@ -29,6 +29,7 @@
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use data_encoding::BASE32_NOPAD;
@@ -68,6 +69,10 @@ pub fn decode_ticket(ticket: &str) -> Result<EndpointAddr, String> {
         .map_err(|e| format!("iroh ticket base32: {e}"))?;
     postcard::from_bytes(&bytes).map_err(|e| format!("iroh ticket decode: {e}"))
 }
+
+/// A type-erased per-connection peer initializer — the `on_peer` closure
+/// after boxing, so a routing table can hold heterogeneous services.
+pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
 
 /// A length-delimited text-frame sink over the QUIC duplex.
 pub type FrameSink = Pin<Box<dyn Sink<String, Error = io::Error> + Send>>;
@@ -170,23 +175,52 @@ where
     T: FnOnce(&str),
     F: Fn(&Peer) + Clone + Send + Sync + 'static,
 {
+    serve_mounted(secret_key, on_ticket, vec![(alpn.to_vec(), Arc::new(on_peer))]).await
+}
+
+/// Bind ONE endpoint that accepts several ALPNs and run the accept loop
+/// forever, **mounting each service by ALPN**: every `(alpn, handler)`
+/// routes connections negotiated on that ALPN onto their own peer. All
+/// mounts share the one endpoint identity, so `on_ticket` is called once
+/// with the single pasteable ticket — a dialer picks a service by passing
+/// its ALPN to [`connect`]. Services never share a peer, so their ops
+/// can't collide.
+pub async fn serve_mounted<T>(
+    secret_key: SecretKey,
+    on_ticket: T,
+    mounts: Vec<(Vec<u8>, PeerHandler)>,
+) -> Result<(), String>
+where
+    T: FnOnce(&str),
+{
+    let alpns: Vec<Vec<u8>> = mounts.iter().map(|(alpn, _)| alpn.clone()).collect();
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![alpn.to_vec()])
+        .alpns(alpns)
         .secret_key(secret_key)
         .bind()
         .await
         .map_err(|e| format!("iroh bind: {e}"))?;
 
     let ticket = encode_ticket(&endpoint.addr())?;
-    info!(endpoint_id = %endpoint.id(), "peerline-iroh endpoint listening");
+    info!(endpoint_id = %endpoint.id(), mounts = mounts.len(), "peerline-iroh endpoint listening");
     on_ticket(&ticket);
 
+    let mounts = Arc::new(mounts);
     while let Some(incoming) = endpoint.accept().await {
-        let on_peer = on_peer.clone();
+        let mounts = mounts.clone();
         tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => serve_conn(conn, on_peer).await,
-                Err(e) => warn!(error = %e, "peerline-iroh: incoming connection failed"),
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!(error = %e, "peerline-iroh: incoming connection failed");
+                    return;
+                }
+            };
+            // Route to the service whose ALPN the client negotiated.
+            let alpn = conn.alpn();
+            match mounts.iter().find(|(a, _)| a == alpn) {
+                Some((_, handler)) => serve_conn(conn, handler.clone()).await,
+                None => warn!(alpn = ?alpn, "peerline-iroh: no mount for negotiated ALPN"),
             }
         });
     }
@@ -239,17 +273,15 @@ pub async fn connect(
 /// Drive one accepted connection: each bi-stream the client opens becomes
 /// its own peer session (looping keeps the connection alive across a
 /// reconnect).
-async fn serve_conn<F>(conn: Connection, on_peer: F)
-where
-    F: Fn(&Peer) + Clone + Send + Sync + 'static,
+async fn serve_conn(conn: Connection, handler: PeerHandler)
 {
     let remote = conn.remote_id();
     info!(%remote, "peerline-iroh connection opened");
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                let on_peer = on_peer.clone();
-                tokio::spawn(async move { drive_stream(send, recv, on_peer).await });
+                let handler = handler.clone();
+                tokio::spawn(async move { drive_stream(send, recv, handler).await });
             }
             Err(e) => {
                 info!(%remote, error = %e, "peerline-iroh connection closed");
@@ -260,14 +292,11 @@ where
 }
 
 /// Bridge one bi-stream to a peerline [`Peer`] via the shared text-frame
-/// codec, run the handler set (`on_peer`), then drive until it ends.
-async fn drive_stream<F>(send: SendStream, recv: RecvStream, on_peer: F)
-where
-    F: Fn(&Peer),
-{
+/// codec, run the handler set, then drive until it ends.
+async fn drive_stream(send: SendStream, recv: RecvStream, handler: PeerHandler) {
     let (sink, stream) = text_frames(tokio::io::join(recv, send));
     let (peer, driver) = Peer::new(sink, stream);
-    on_peer(&peer);
+    handler(&peer);
     driver.await;
 }
 

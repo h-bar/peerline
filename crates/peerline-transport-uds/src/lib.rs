@@ -16,7 +16,8 @@
 #![forbid(unsafe_code)]
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
@@ -24,6 +25,10 @@ use peerline::runtime::Peer;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{debug, info, warn};
+
+/// A type-erased per-connection peer initializer — the `on_peer` closure
+/// after boxing, so a routing table can hold heterogeneous services.
+pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
 
 /// Bind to `path` and serve peerline over a Unix domain socket forever,
 /// driving one [`peerline::runtime::Peer`] per accepted connection —
@@ -34,12 +39,29 @@ pub async fn serve<F>(path: impl AsRef<Path>, on_peer: F) -> Result<(), String>
 where
     F: Fn(&Peer) + Clone + Send + Sync + 'static,
 {
-    let path = path.as_ref();
-    match tokio::fs::remove_file(path).await {
+    serve_one(path.as_ref().to_path_buf(), Arc::new(on_peer)).await
+}
+
+/// Serve several peerline services over a Unix domain socket, **mounted by
+/// socket path**: each `(path, handler)` gets its own listener, so a
+/// client reaches one service by connecting to that socket. Unlike WS
+/// (paths on one port) or iroh (ALPNs on one endpoint), a UDS mount is a
+/// distinct socket file — the filesystem is the namespace. All listeners
+/// run concurrently; the call returns if any one fails to bind or accept.
+pub async fn serve_mounted(mounts: Vec<(PathBuf, PeerHandler)>) -> Result<(), String> {
+    let listeners = mounts.into_iter().map(|(path, handler)| serve_one(path, handler));
+    futures::future::try_join_all(listeners).await.map(|_| ())
+}
+
+/// One UDS listener: unlink + bind `path`, tighten perms, then accept
+/// forever, driving `handler` per connection. The shared core behind both
+/// [`serve`] and [`serve_mounted`].
+async fn serve_one(path: PathBuf, handler: PeerHandler) -> Result<(), String> {
+    match tokio::fs::remove_file(&path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         other => other.map_err(|e| format!("uds unlink {}: {e}", path.display()))?,
     }
-    let listener = UnixListener::bind(path).map_err(|e| format!("uds bind: {e}"))?;
+    let listener = UnixListener::bind(&path).map_err(|e| format!("uds bind: {e}"))?;
     // The socket is created under the process umask, which commonly leaves
     // it group/world-connectable. Tighten it to owner-only so access
     // control doesn't silently depend on the caller's umask.
@@ -47,7 +69,7 @@ where
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(path, perms)
+        tokio::fs::set_permissions(&path, perms)
             .await
             .map_err(|e| format!("uds chmod {}: {e}", path.display()))?;
     }
@@ -64,8 +86,8 @@ where
                 continue;
             }
         };
-        let on_peer = on_peer.clone();
-        tokio::spawn(async move { serve_conn(stream, on_peer).await });
+        let handler = handler.clone();
+        tokio::spawn(async move { serve_conn(stream, handler).await });
     }
 }
 
@@ -85,14 +107,11 @@ pub async fn connect(path: impl AsRef<Path>) -> Result<(Peer, BoxFuture<'static,
 }
 
 /// Drive one accepted connection: newline-delimited frames into a
-/// [`Peer`], run the handler set (`on_peer`), then drive until it ends.
-async fn serve_conn<F>(stream: UnixStream, on_peer: F)
-where
-    F: Fn(&Peer),
-{
+/// [`Peer`], run the handler set, then drive until it ends.
+async fn serve_conn(stream: UnixStream, handler: PeerHandler) {
     debug!("peerline-uds connection opened");
     let (peer, driver) = peer_over(stream);
-    on_peer(&peer);
+    handler(&peer);
     driver.await;
     debug!("peerline-uds connection closed");
 }

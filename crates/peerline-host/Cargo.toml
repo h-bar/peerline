@@ -1,0 +1,30 @@
+[package]
+name = "peerline-host"
+description = "Unified multi-service host for peerline — register several `Service`s and serve them all from one binary over WS / UDS / iroh, each mounted under its own name (WS path, UDS socket, iroh ALPN) so their ops never collide. Replaces the per-service `serve` + transport fan-out + shutdown boilerplate."
+version = "0.0.4"
+edition = "2024"
+license = "MIT"
+
+[features]
+# All transports on by default; a consumer that only serves some can opt
+# out (e.g. a WS+UDS daemon skips the heavy iroh/QUIC stack with
+# `default-features = false, features = ["ws", "uds"]`).
+default = ["ws", "uds", "iroh"]
+ws = ["dep:peerline-transport-ws"]
+uds = ["dep:peerline-transport-uds"]
+iroh = ["dep:peerline-transport-iroh"]
+
+[dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "signal"] }
+tracing = "0.1"
+peerline = { path = "../..", features = ["runtime"] }
+peerline-transport-ws = { path = "../peerline-transport-ws", optional = true }
+peerline-transport-uds = { path = "../peerline-transport-uds", optional = true }
+peerline-transport-iroh = { path = "../peerline-transport-iroh", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+serde = { version = "1", features = ["derive"] }
+# The WS dial side, for the host integration test.
+peerline-transport-ws = { path = "../peerline-transport-ws" }

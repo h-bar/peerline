@@ -15,9 +15,9 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -28,9 +28,13 @@ use peerline::runtime::Peer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+/// A type-erased per-connection peer initializer — the `on_peer` closure
+/// after boxing, so a routing table can hold heterogeneous services.
+pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
+
 /// Bind to `addr` and serve peerline over WebSocket forever, driving one
 /// [`peerline::runtime::Peer`] per connection — configured by `on_peer`
-/// (register your handlers there).
+/// (register your handlers there). The service is mounted at `/`.
 ///
 /// Permissive CORS is applied so browser clients on any origin can
 /// connect; front a scoped origin allowlist in production. A single
@@ -39,33 +43,40 @@ pub async fn serve<F>(addr: SocketAddr, on_peer: F) -> Result<(), String>
 where
     F: Fn(&Peer) + Clone + Send + Sync + 'static,
 {
-    info!(addr = %addr, "peerline-ws listening");
-    let app = Router::new()
-        .route("/", get(ws_upgrade::<F>))
-        .layer(CorsLayer::permissive())
-        .with_state(on_peer);
+    serve_mounted(addr, vec![("/".to_string(), Arc::new(on_peer))]).await
+}
+
+/// Bind to `addr` and serve several peerline services on one port,
+/// **mounted by path**: each `(path, handler)` routes connections to that
+/// path onto their own peer. A client dials `ws://host:port<path>` to
+/// reach one service; the services never share a peer, so their ops can't
+/// collide. Same CORS + frame ceiling as [`serve`].
+pub async fn serve_mounted(
+    addr: SocketAddr,
+    mounts: Vec<(String, PeerHandler)>,
+) -> Result<(), String> {
+    let mut app = Router::new();
+    for (path, handler) in mounts {
+        info!(addr = %addr, path, "peerline-ws mount");
+        app = app.route(&path, get(move |ws: WebSocketUpgrade| ws_upgrade(ws, handler.clone())));
+    }
+    let app = app.layer(CorsLayer::permissive());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("ws bind: {e}"))?;
     axum::serve(listener, app).await.map_err(|e| format!("ws serve: {e}"))
 }
 
-async fn ws_upgrade<F>(ws: WebSocketUpgrade, State(on_peer): State<F>) -> impl IntoResponse
-where
-    F: Fn(&Peer) + Clone + Send + Sync + 'static,
-{
+async fn ws_upgrade(ws: WebSocketUpgrade, handler: PeerHandler) -> impl IntoResponse {
     // Pin the frame ceiling to the shared [`peerline::MAX_FRAME_LEN`]
     // rather than tungstenite's default. `max_message_size` bounds the
     // reassembled message; `max_frame_size` bounds one WebSocket frame.
     ws.max_message_size(peerline::MAX_FRAME_LEN)
         .max_frame_size(peerline::MAX_FRAME_LEN)
-        .on_upgrade(move |socket| serve_conn(socket, on_peer))
+        .on_upgrade(move |socket| serve_conn(socket, handler))
 }
 
-async fn serve_conn<F>(socket: WebSocket, on_peer: F)
-where
-    F: Fn(&Peer),
-{
+async fn serve_conn(socket: WebSocket, handler: PeerHandler) {
     info!("peerline-ws connection opened");
     let (ws_sink, ws_stream) = socket.split();
     let sink = Box::pin(
@@ -81,7 +92,7 @@ where
         }
     }));
     let (peer, driver) = Peer::new(sink, stream);
-    on_peer(&peer);
+    handler(&peer);
     driver.await;
     info!("peerline-ws connection closed");
 }
