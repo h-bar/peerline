@@ -183,7 +183,9 @@ impl Host {
             let mut mounts = Vec::new();
             for (name, mount, handler) in &prepared {
                 if let Some(path) = &mount.ws_path {
-                    info!(service = name, %addr, path, "peerline-host: ws mount");
+                    // Explicit dial coordinates so a caller sees how to reach us.
+                    info!(service = name, url = %format!("ws://{addr}{path}"),
+                          "peerline-host: reachable (ws)");
                     mounts.push((path.clone(), handler.clone()));
                 }
             }
@@ -203,7 +205,8 @@ impl Host {
                             format!("peerline-host: uds dir {}: {e}", dir.display())
                         })?;
                     }
-                    info!(service = name, socket = %path.display(), "peerline-host: uds mount");
+                    info!(service = name, socket = %path.display(),
+                          "peerline-host: reachable (uds)");
                     mounts.push((path.clone(), handler.clone()));
                 }
             }
@@ -216,18 +219,21 @@ impl Host {
             }
         }
 
-        // iroh — ALPNs on the shared endpoint.
+        // iroh — ALPNs on the shared endpoint. The ticket isn't known until
+        // the endpoint binds, so per-service dial info is printed from the
+        // bind callback (see `iroh_serve`); collect (name, alpn) for it.
         if let Some(key_path) = &self.iroh_key {
             let mut mounts = Vec::new();
+            let mut dials: Vec<(String, String)> = Vec::new();
             for (name, mount, handler) in &prepared {
                 if let Some(alpn) = &mount.iroh_alpn {
-                    info!(service = name, alpn = ?alpn, "peerline-host: iroh mount");
+                    dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
                     mounts.push((alpn.clone(), handler.clone()));
                 }
             }
             reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
             if !mounts.is_empty() {
-                serves.push(iroh_serve(key_path.clone(), mounts)?);
+                serves.push(iroh_serve(key_path.clone(), mounts, dials)?);
             }
         }
 
@@ -277,17 +283,29 @@ fn uds_serve(_: Vec<(PathBuf, PeerHandler)>) -> Result<Serve, String> {
 fn iroh_serve(
     key_path: Option<PathBuf>,
     mounts: Vec<(Vec<u8>, PeerHandler)>,
+    dials: Vec<(String, String)>,
 ) -> Result<Serve, String> {
     let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
         .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
     Ok(Box::pin(peerline_transport_iroh::serve_mounted(
         key,
-        |ticket| info!(ticket, "peerline-host: iroh endpoint ready"),
+        // The one ticket addresses the shared endpoint; each service is
+        // reached by dialing it with that service's ALPN. Print both.
+        move |ticket| {
+            for (name, alpn) in &dials {
+                info!(service = %name, ticket, alpn = %alpn,
+                      "peerline-host: reachable (iroh — dial ticket with this alpn)");
+            }
+        },
         mounts,
     )))
 }
 #[cfg(not(feature = "iroh"))]
-fn iroh_serve(_: Option<PathBuf>, _: Vec<(Vec<u8>, PeerHandler)>) -> Result<Serve, String> {
+fn iroh_serve(
+    _: Option<PathBuf>,
+    _: Vec<(Vec<u8>, PeerHandler)>,
+    _: Vec<(String, String)>,
+) -> Result<Serve, String> {
     Err("peerline-host: iroh mounts configured but the `iroh` feature is disabled".into())
 }
 
