@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-iroh"
-version = "0.0.1"
+version = "0.0.4"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-uds"
-version = "0.0.1"
+version = "0.0.4"
 dependencies = [
  "futures",
  "peerline",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-ws"
-version = "0.0.1"
+version = "0.0.4"
 dependencies = [
  "axum",
  "futures",
