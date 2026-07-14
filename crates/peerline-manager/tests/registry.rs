@@ -28,7 +28,7 @@ async fn register_list_lookup_and_expire_on_ttl() {
     let sock = std::env::temp_dir().join(format!("peerline-mgr-{}.sock", std::process::id()));
     let s = sock.clone();
     tokio::spawn(async move {
-        let _ = Host::new().mount(Manager::new(), Mount::new().uds(s)).run().await;
+        let _ = Host::new().mount(Manager::new(), Mount::new().uds(s)).no_report().run().await;
     });
 
     let peer = client(&sock).await;

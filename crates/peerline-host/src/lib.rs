@@ -109,13 +109,34 @@ impl Mount {
     }
 }
 
+/// Whether/where the host registers with a `peerline-manager`.
+#[derive(Default)]
+enum ReportMode {
+    /// Register with the default manager (`PEERLINE_MANAGER_SOCK` or the
+    /// canonical `/tmp/peerline-manager.sock`). The default.
+    #[default]
+    Auto,
+    /// Register with a specific manager socket.
+    To(PathBuf),
+    /// Don't register at all.
+    Off,
+}
+
+/// The default manager socket a host reports to — the same
+/// `PEERLINE_MANAGER_SOCK` (+ default) the manager itself binds.
+fn default_manager_sock() -> PathBuf {
+    std::env::var_os("PEERLINE_MANAGER_SOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/peerline-manager.sock"))
+}
+
 /// Builder for a unified multi-service peerline host.
 #[derive(Default)]
 pub struct Host {
     services: Vec<(Arc<dyn Service>, Mount)>,
     ws_bind: Option<SocketAddr>,
     iroh_key: Option<Option<PathBuf>>,
-    report_to: Option<PathBuf>,
+    report: ReportMode,
 }
 
 impl Host {
@@ -148,18 +169,29 @@ impl Host {
         self
     }
 
-    /// Auto-register this host's services + dial coordinates with a
-    /// `peerline-manager` listening on the Unix socket `manager_sock`.
+    /// Register this host's services + dial coordinates with a
+    /// `peerline-manager` at a **specific** socket, overriding the default.
+    ///
+    /// By default a host already reports to the default manager
+    /// (`PEERLINE_MANAGER_SOCK` or `/tmp/peerline-manager.sock`); call this
+    /// only to target a different one, or [`Host::no_report`] to opt out.
     ///
     /// Once every transport binds (including the iroh ticket, if any), the
-    /// host dials the manager and opens the `manager.register` stream,
-    /// holding it open for the process lifetime — so the manager evicts this
-    /// host the moment it exits or crashes (connection-based liveness). If
-    /// the manager is down or restarts, the host keeps retrying. Requires
-    /// the `uds` feature.
+    /// host registers and heartbeats, holding the connection for the process
+    /// lifetime; the manager expires it on TTL after it exits. Harmless if no
+    /// manager is running (it retries). Requires the `uds` feature.
     #[must_use]
     pub fn report_to(mut self, manager_sock: impl Into<PathBuf>) -> Self {
-        self.report_to = Some(manager_sock.into());
+        self.report = ReportMode::To(manager_sock.into());
+        self
+    }
+
+    /// Opt out of registering with a manager. By default a host reports to
+    /// the default manager socket; use this for standalone services (or
+    /// tests) that shouldn't touch a manager.
+    #[must_use]
+    pub fn no_report(mut self) -> Self {
+        self.report = ReportMode::Off;
         self
     }
 
@@ -195,7 +227,8 @@ impl Host {
 
         let mut serves: Vec<Serve> = Vec::new();
         // Receives the iroh ticket once the endpoint binds, so the manager
-        // report can include it (see `report_to`). Only wired when reporting.
+        // report can include it. Only wired when we're going to report.
+        let will_report = !matches!(self.report, ReportMode::Off);
         let mut ticket_rx: Option<oneshot::Receiver<String>> = None;
 
         // WebSocket — paths on the shared port.
@@ -254,7 +287,7 @@ impl Host {
             reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
             if !mounts.is_empty() {
                 // When reporting, capture the ticket (async, known at bind).
-                let ticket_tx = if self.report_to.is_some() {
+                let ticket_tx = if will_report {
                     let (tx, rx) = oneshot::channel();
                     ticket_rx = Some(rx);
                     Some(tx)
@@ -271,16 +304,22 @@ impl Host {
                 .into());
         }
 
-        // Auto-register with a manager, if requested. The report loop is
-        // driven inside the `select!` below (never resolving), so it — and
-        // thus the manager connection that keeps us registered — is dropped
-        // when the host shuts down, which deregisters us.
-        let report: BoxFuture<'static, ()> = match self.report_to.clone() {
-            Some(sock) => {
-                build_report(sock, &prepared, self.ws_bind, self.iroh_key.is_some(), ticket_rx)?
-            }
-            None => Box::pin(std::future::pending()),
+        // Register with a manager unless opted out. Default: the canonical
+        // manager socket. The report loop is driven inside the `select!`
+        // below (never resolving), so it — and thus the manager connection
+        // that keeps us registered — is dropped when the host shuts down,
+        // which deregisters us.
+        let report_sock = match &self.report {
+            ReportMode::Off => None,
+            ReportMode::To(path) => Some(path.clone()),
+            ReportMode::Auto => Some(default_manager_sock()),
         };
+        #[cfg(not(feature = "uds"))]
+        if matches!(self.report, ReportMode::To(_)) {
+            info!("peerline-host: report_to needs the `uds` feature; not registering");
+        }
+        let report =
+            build_report_future(report_sock, &prepared, self.ws_bind, self.iroh_key.is_some(), ticket_rx)?;
 
         info!(services = self.services.len(), transports = serves.len(), "peerline-host starting");
 
@@ -394,15 +433,32 @@ fn build_report(
     Ok(Box::pin(report_loop(manager_sock, host, std::process::id(), endpoints, iroh_dials, ticket_rx)))
 }
 
-#[cfg(not(feature = "uds"))]
-fn build_report(
-    _: PathBuf,
-    _: &[(&'static str, Mount, PeerHandler)],
-    _: Option<SocketAddr>,
-    _: bool,
-    _: Option<oneshot::Receiver<String>>,
+/// Resolve the report target: `Some` ⇒ the registration loop, `None` ⇒ a
+/// no-op. Split on `uds` (the manager is dialed over uds); without it,
+/// reporting is a no-op.
+#[cfg(feature = "uds")]
+fn build_report_future(
+    report_sock: Option<PathBuf>,
+    prepared: &[(&'static str, Mount, PeerHandler)],
+    ws_bind: Option<SocketAddr>,
+    iroh_enabled: bool,
+    ticket_rx: Option<oneshot::Receiver<String>>,
 ) -> Result<BoxFuture<'static, ()>, String> {
-    Err("peerline-host: report_to requires the `uds` feature".into())
+    match report_sock {
+        Some(sock) => build_report(sock, prepared, ws_bind, iroh_enabled, ticket_rx),
+        None => Ok(Box::pin(std::future::pending())),
+    }
+}
+
+#[cfg(not(feature = "uds"))]
+fn build_report_future(
+    _report_sock: Option<PathBuf>,
+    _prepared: &[(&'static str, Mount, PeerHandler)],
+    _ws_bind: Option<SocketAddr>,
+    _iroh_enabled: bool,
+    _ticket_rx: Option<oneshot::Receiver<String>>,
+) -> Result<BoxFuture<'static, ()>, String> {
+    Ok(Box::pin(std::future::pending()))
 }
 
 /// Fill in the iroh ticket (once bound), then keep the host registered with

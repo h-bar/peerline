@@ -54,7 +54,8 @@ async fn host_mounts_two_services_by_path() {
     let host = Host::new()
         .mount(Echo { name: "alpha" }, Mount::new().ws("/alpha"))
         .mount(Echo { name: "beta" }, Mount::new().ws("/beta"))
-        .ws_bind(addr);
+        .ws_bind(addr)
+        .no_report();
     tokio::spawn(async move {
         let _ = host.run().await;
     });

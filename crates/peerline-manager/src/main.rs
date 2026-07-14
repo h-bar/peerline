@@ -59,11 +59,13 @@ async fn main() -> Result<(), String> {
     let ws_addr = resolve_addr("PEERLINE_MANAGER_WS", DEFAULT_WS);
     let ui_addr = resolve_addr("PEERLINE_MANAGER_UI", DEFAULT_UI);
 
-    let mut mount = Mount::new().uds(sock.clone());
-    // The manager is itself a peerline service, so it registers in its own
-    // registry (dialing its own socket) — `manager.list` then also reports
-    // the manager's own endpoints, making the registry self-describing.
-    let mut host = Host::new().report_to(sock);
+    let mut mount = Mount::new().uds(sock);
+    // The manager is itself a peerline service; the host's default
+    // auto-registration points at the same socket the manager binds, so the
+    // manager registers in its own registry — `manager.list` then also
+    // reports the manager's own endpoints, making the registry
+    // self-describing.
+    let mut host = Host::new();
     if let Some(addr) = ws_addr {
         mount = mount.ws("/");
         host = host.ws_bind(addr);

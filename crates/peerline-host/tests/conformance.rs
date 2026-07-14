@@ -389,7 +389,8 @@ impl Harness for HostWs {
             tokio::spawn(async move {
                 let host = peerline_host::Host::new()
                     .mount(RegService(reg), peerline_host::Mount::new().ws("/"))
-                    .ws_bind(addr);
+                    .ws_bind(addr)
+                    .no_report();
                 let _ = host.run().await;
             });
             Ok(Box::new(WsEp { url: format!("ws://{addr}/") }) as Box<dyn Endpoint>)

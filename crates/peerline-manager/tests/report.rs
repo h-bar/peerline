@@ -42,7 +42,7 @@ async fn host_auto_registers_and_deregisters() {
     // Manager.
     let m = mgr_sock.clone();
     tokio::spawn(async move {
-        let _ = Host::new().mount(Manager::new(), Mount::new().uds(m)).run().await;
+        let _ = Host::new().mount(Manager::new(), Mount::new().uds(m)).no_report().run().await;
     });
 
     // A reporting host with a controllable shutdown.
