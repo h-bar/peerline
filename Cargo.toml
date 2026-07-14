@@ -8,6 +8,8 @@ members = [
     "crates/peerline-transport-ws",
     "crates/peerline-transport-uds",
     "crates/peerline-host",
+    "crates/peerline-manager-protocol",
+    "crates/peerline-manager",
 ]
 exclude = ["crates/tauri-plugin-peerline-iroh"]
 resolver = "2"

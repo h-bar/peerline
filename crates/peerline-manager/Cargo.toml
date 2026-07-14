@@ -1,0 +1,26 @@
+[package]
+name = "peerline-manager"
+description = "A live registry of the peerline services running on a host — itself a peerline service. Hosts register their dial coordinates over peerline (connection-based liveness, no heartbeats); clients query `manager.list` / `manager.lookup`. Reachable over any transport the host mounts it on."
+version = "0.0.4"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "peerline-manager"
+path = "src/main.rs"
+
+[dependencies]
+peerline = { path = "../..", features = ["runtime"] }
+peerline-manager-protocol = { path = "../peerline-manager-protocol" }
+serde_json = "1"
+tracing = "0.1"
+# Used by the `peerline-manager` binary to actually run the service. Only the
+# local (uds) + browser (ws) transports — the manager doesn't need iroh.
+peerline-host = { path = "../peerline-host", default-features = false, features = ["uds", "ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+peerline-transport-uds = { path = "../peerline-transport-uds" }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+futures = "0.3"

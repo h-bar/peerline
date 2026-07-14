@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use peerline::runtime::Peer;
+use tokio::sync::oneshot;
 use tracing::info;
 
 /// The boxed per-connection peer initializer handed to each transport.
@@ -114,6 +115,7 @@ pub struct Host {
     services: Vec<(Arc<dyn Service>, Mount)>,
     ws_bind: Option<SocketAddr>,
     iroh_key: Option<Option<PathBuf>>,
+    report_to: Option<PathBuf>,
 }
 
 impl Host {
@@ -143,6 +145,21 @@ impl Host {
     #[must_use]
     pub fn iroh_endpoint(mut self, key_path: Option<PathBuf>) -> Self {
         self.iroh_key = Some(key_path);
+        self
+    }
+
+    /// Auto-register this host's services + dial coordinates with a
+    /// `peerline-manager` listening on the Unix socket `manager_sock`.
+    ///
+    /// Once every transport binds (including the iroh ticket, if any), the
+    /// host dials the manager and opens the `manager.register` stream,
+    /// holding it open for the process lifetime — so the manager evicts this
+    /// host the moment it exits or crashes (connection-based liveness). If
+    /// the manager is down or restarts, the host keeps retrying. Requires
+    /// the `uds` feature.
+    #[must_use]
+    pub fn report_to(mut self, manager_sock: impl Into<PathBuf>) -> Self {
+        self.report_to = Some(manager_sock.into());
         self
     }
 
@@ -177,6 +194,9 @@ impl Host {
             .collect();
 
         let mut serves: Vec<Serve> = Vec::new();
+        // Receives the iroh ticket once the endpoint binds, so the manager
+        // report can include it (see `report_to`). Only wired when reporting.
+        let mut ticket_rx: Option<oneshot::Receiver<String>> = None;
 
         // WebSocket — paths on the shared port.
         if let Some(addr) = self.ws_bind {
@@ -233,7 +253,15 @@ impl Host {
             }
             reject_dupes("iroh alpn", mounts.iter().map(|(a, _)| a.clone()))?;
             if !mounts.is_empty() {
-                serves.push(iroh_serve(key_path.clone(), mounts, dials)?);
+                // When reporting, capture the ticket (async, known at bind).
+                let ticket_tx = if self.report_to.is_some() {
+                    let (tx, rx) = oneshot::channel();
+                    ticket_rx = Some(rx);
+                    Some(tx)
+                } else {
+                    None
+                };
+                serves.push(iroh_serve(key_path.clone(), mounts, dials, ticket_tx)?);
             }
         }
 
@@ -243,12 +271,25 @@ impl Host {
                 .into());
         }
 
+        // Auto-register with a manager, if requested. The report loop is
+        // driven inside the `select!` below (never resolving), so it — and
+        // thus the manager connection that keeps us registered — is dropped
+        // when the host shuts down, which deregisters us.
+        let report: BoxFuture<'static, ()> = match self.report_to.clone() {
+            Some(sock) => {
+                build_report(sock, &prepared, self.ws_bind, self.iroh_key.is_some(), ticket_rx)?
+            }
+            None => Box::pin(std::future::pending()),
+        };
+
         info!(services = self.services.len(), transports = serves.len(), "peerline-host starting");
 
         // Run every transport until one errors or shutdown fires. Dropping
-        // the serve futures on shutdown tears the listeners down.
+        // the serve futures (and the report loop) on shutdown tears the
+        // listeners and the manager registration down.
         tokio::select! {
             r = futures::future::try_join_all(serves) => r.map(|_| ()),
+            _ = report => Ok(()), // never resolves; here only to be driven
             _ = shutdown => {
                 info!("peerline-host: shutdown signal received, stopping");
                 Ok(())
@@ -284,17 +325,22 @@ fn iroh_serve(
     key_path: Option<PathBuf>,
     mounts: Vec<(Vec<u8>, PeerHandler)>,
     dials: Vec<(String, String)>,
+    ticket_tx: Option<oneshot::Sender<String>>,
 ) -> Result<Serve, String> {
     let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
         .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
     Ok(Box::pin(peerline_transport_iroh::serve_mounted(
         key,
         // The one ticket addresses the shared endpoint; each service is
-        // reached by dialing it with that service's ALPN. Print both.
+        // reached by dialing it with that service's ALPN. Print both, and
+        // hand the ticket to the manager report if one is waiting.
         move |ticket| {
             for (name, alpn) in &dials {
                 info!(service = %name, ticket, alpn = %alpn,
                       "peerline-host: reachable (iroh — dial ticket with this alpn)");
+            }
+            if let Some(tx) = ticket_tx {
+                let _ = tx.send(ticket.to_string());
             }
         },
         mounts,
@@ -305,8 +351,138 @@ fn iroh_serve(
     _: Option<PathBuf>,
     _: Vec<(Vec<u8>, PeerHandler)>,
     _: Vec<(String, String)>,
+    _: Option<oneshot::Sender<String>>,
 ) -> Result<Serve, String> {
     Err("peerline-host: iroh mounts configured but the `iroh` feature is disabled".into())
+}
+
+// --- manager auto-registration (`report_to`) -------------------------------
+
+/// Build this host's endpoint report from its mounts and return the
+/// registration loop future. Gated on `uds` (the manager is dialed over uds).
+#[cfg(feature = "uds")]
+fn build_report(
+    manager_sock: PathBuf,
+    prepared: &[(&'static str, Mount, PeerHandler)],
+    ws_bind: Option<SocketAddr>,
+    iroh_enabled: bool,
+    ticket_rx: Option<oneshot::Receiver<String>>,
+) -> Result<BoxFuture<'static, ()>, String> {
+    use peerline_manager_protocol::Endpoints;
+
+    let mut endpoints: std::collections::BTreeMap<String, Endpoints> =
+        std::collections::BTreeMap::new();
+    let mut iroh_dials: Vec<(String, String)> = Vec::new();
+    for (name, mount, _) in prepared {
+        let e = endpoints.entry(name.to_string()).or_default();
+        if let (Some(addr), Some(path)) = (ws_bind, &mount.ws_path) {
+            e.ws.push(format!("ws://{addr}{path}"));
+        }
+        if let Some(path) = &mount.uds_path {
+            e.uds.push(path.display().to_string());
+        }
+        if iroh_enabled && let Some(alpn) = &mount.iroh_alpn {
+            iroh_dials.push((name.to_string(), String::from_utf8_lossy(alpn).into_owned()));
+        }
+    }
+
+    let host = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "peerline-host".into());
+
+    Ok(Box::pin(report_loop(manager_sock, host, std::process::id(), endpoints, iroh_dials, ticket_rx)))
+}
+
+#[cfg(not(feature = "uds"))]
+fn build_report(
+    _: PathBuf,
+    _: &[(&'static str, Mount, PeerHandler)],
+    _: Option<SocketAddr>,
+    _: bool,
+    _: Option<oneshot::Receiver<String>>,
+) -> Result<BoxFuture<'static, ()>, String> {
+    Err("peerline-host: report_to requires the `uds` feature".into())
+}
+
+/// Fill in the iroh ticket (once bound), then keep the host registered with
+/// the manager for as long as the process lives, reconnecting on failure.
+#[cfg(feature = "uds")]
+async fn report_loop(
+    manager_sock: PathBuf,
+    host: String,
+    pid: u32,
+    mut endpoints: std::collections::BTreeMap<String, peerline_manager_protocol::Endpoints>,
+    iroh_dials: Vec<(String, String)>,
+    ticket_rx: Option<oneshot::Receiver<String>>,
+) {
+    use peerline_manager_protocol::{IrohDial, Registration, ServiceEntry};
+
+    // The iroh ticket isn't known until the endpoint binds.
+    if let Some(rx) = ticket_rx
+        && let Ok(ticket) = rx.await
+    {
+        for (name, alpn) in iroh_dials {
+            endpoints.entry(name).or_default().iroh.push(IrohDial { ticket: ticket.clone(), alpn });
+        }
+    }
+
+    let services: Vec<ServiceEntry> = endpoints
+        .into_iter()
+        .map(|(service, endpoints)| ServiceEntry { service, endpoints })
+        .collect();
+    let registration = Registration { host, pid, services };
+
+    loop {
+        if let Err(e) = report_once(&manager_sock, &registration).await {
+            tracing::debug!(error = %e, manager = %manager_sock.display(),
+                            "peerline-host: manager report failed; will retry");
+        }
+        // The connection ended (or never opened) — back off and re-register.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+/// How often the host heartbeats the manager. Well under the manager's TTL.
+#[cfg(feature = "uds")]
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// One registration session: dial the manager, register, then heartbeat for
+/// as long as the connection lives. Returns when the connection ends (manager
+/// gone / restarted) so [`report_loop`] can reconnect. Dropping this future
+/// (host shutdown) drops the connection; the manager then expires us on TTL.
+#[cfg(feature = "uds")]
+async fn report_once(
+    manager_sock: &std::path::Path,
+    registration: &peerline_manager_protocol::Registration,
+) -> Result<(), String> {
+    use peerline_manager_protocol::{Heartbeat, METHOD_HEARTBEAT, METHOD_REGISTER, RegisterAck};
+
+    let (peer, driver) = peerline_transport_uds::connect(manager_sock).await?;
+
+    let work = async {
+        let ack: RegisterAck =
+            peer.call(METHOD_REGISTER, registration).await.map_err(|e| e.to_string())?;
+        info!(id = ack.id, manager = %manager_sock.display(),
+              "peerline-host: registered with manager");
+        loop {
+            tokio::time::sleep(HEARTBEAT).await;
+            // A failed enqueue means the peer is gone; the driver will also
+            // resolve, so either arm ends this session and triggers a retry.
+            if peer.notify(METHOD_HEARTBEAT, &Heartbeat { id: ack.id }).is_err() {
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    };
+
+    // Drive the connection and the register+heartbeat work together, both
+    // owned here — so host shutdown (dropping this future) closes the wire.
+    tokio::select! {
+        _ = driver => {}
+        r = work => r?,
+    }
+    Ok(())
 }
 
 /// Reject two services sharing one address on a transport — that would let

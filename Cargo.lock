@@ -2344,6 +2344,7 @@ version = "0.0.4"
 dependencies = [
  "futures",
  "peerline",
+ "peerline-manager-protocol",
  "peerline-transport-iroh",
  "peerline-transport-uds",
  "peerline-transport-ws",
@@ -2351,6 +2352,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "peerline-manager"
+version = "0.0.4"
+dependencies = [
+ "futures",
+ "peerline",
+ "peerline-host",
+ "peerline-manager-protocol",
+ "peerline-transport-uds",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "peerline-manager-protocol"
+version = "0.0.4"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

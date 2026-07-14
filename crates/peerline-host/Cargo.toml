@@ -16,9 +16,11 @@ iroh = ["dep:peerline-transport-iroh"]
 
 [dependencies]
 futures = "0.3"
-tokio = { version = "1", features = ["macros", "rt", "signal"] }
+tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 peerline = { path = "../..", features = ["runtime"] }
+# Wire shapes for `Host::report_to` (auto-registration with a manager).
+peerline-manager-protocol = { path = "../peerline-manager-protocol" }
 peerline-transport-ws = { path = "../peerline-transport-ws", optional = true }
 peerline-transport-uds = { path = "../peerline-transport-uds", optional = true }
 peerline-transport-iroh = { path = "../peerline-transport-iroh", optional = true }
