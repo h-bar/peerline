@@ -6,10 +6,19 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+# `axum` powers the accept side (`serve`); `tokio-tungstenite` powers the
+# dial side (`connect`). Both compile unconditionally — no feature gates.
+# Pinned to the same tungstenite major axum re-exports so only one copy of
+# the WS protocol code is linked.
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["cors"] }
+tokio-tungstenite = "0.29"
 futures = "0.3"
 tokio = { version = "1", features = ["net", "rt"] }
 tracing = "0.1"
 # `Peer` (one per connection) + the canonical frame-size ceiling.
 peerline = { path = "../..", features = ["runtime"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+serde = { version = "1", features = ["derive"] }

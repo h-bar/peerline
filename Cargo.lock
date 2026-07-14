@@ -2360,6 +2360,7 @@ version = "0.0.4"
 dependencies = [
  "futures",
  "peerline",
+ "serde",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2372,7 +2373,9 @@ dependencies = [
  "axum",
  "futures",
  "peerline",
+ "serde",
  "tokio",
+ "tokio-tungstenite",
  "tower-http 0.7.0",
  "tracing",
 ]

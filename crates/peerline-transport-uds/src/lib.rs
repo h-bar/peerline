@@ -1,14 +1,24 @@
 //! Unix-domain-socket transport for peerline, for local tooling.
 //!
 //! Each frame is a single JSON object terminated by a newline
-//! ([`tokio_util::codec::LinesCodec`]). [`serve`] binds a listener and
-//! drives one [`peerline::runtime::Peer`] per accepted connection,
-//! configured by a caller-supplied handler closure.
+//! ([`tokio_util::codec::LinesCodec`]). The transport is symmetric — the
+//! same wire framing on both ends:
+//!
+//! - [`serve`] (accept side) binds a listener and drives one
+//!   [`peerline::runtime::Peer`] per accepted connection, configured by a
+//!   caller-supplied handler closure.
+//! - [`connect`] (dial side) connects to an existing socket and returns
+//!   one `(Peer, driver)` for the caller to configure and drive.
+//!
+//! peerline is peer-symmetric, so the bind/dial choice only decides which
+//! end is addressable — once connected, either peer may issue any frame.
 
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::path::Path;
 
+use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use peerline::runtime::Peer;
 use tokio::net::{UnixListener, UnixStream};
@@ -59,6 +69,21 @@ where
     }
 }
 
+/// Connect to a peerline endpoint at `path` (the dial side of [`serve`])
+/// and return one `(Peer, driver)`. Register handlers on the peer, then
+/// drive `driver` to run the session; it resolves when the socket closes.
+///
+/// The framing is identical to [`serve`], so either end may bind or dial.
+pub async fn connect(path: impl AsRef<Path>) -> Result<(Peer, BoxFuture<'static, ()>), String> {
+    let path = path.as_ref();
+    let stream = UnixStream::connect(path)
+        .await
+        .map_err(|e| format!("uds connect {}: {e}", path.display()))?;
+    debug!(socket = %path.display(), "peerline-uds dialed");
+    let (peer, driver) = peer_over(stream);
+    Ok((peer, Box::pin(driver)))
+}
+
 /// Drive one accepted connection: newline-delimited frames into a
 /// [`Peer`], run the handler set (`on_peer`), then drive until it ends.
 async fn serve_conn<F>(stream: UnixStream, on_peer: F)
@@ -66,13 +91,20 @@ where
     F: Fn(&Peer),
 {
     debug!("peerline-uds connection opened");
+    let (peer, driver) = peer_over(stream);
+    on_peer(&peer);
+    driver.await;
+    debug!("peerline-uds connection closed");
+}
+
+/// Wrap a connected [`UnixStream`] as a peerline `(Peer, driver)` over the
+/// shared newline framing — the one place both [`serve`] and [`connect`]
+/// build the codec, so the two ends can't drift.
+fn peer_over(stream: UnixStream) -> (Peer, impl Future<Output = ()>) {
     // Pin the line ceiling to the shared [`peerline::MAX_FRAME_LEN`]
     // rather than `LinesCodec`'s unbounded default, so a single JSON-RPC
     // frame is capped at the same size as the other transports.
     let framed = Framed::new(stream, LinesCodec::new_with_max_length(peerline::MAX_FRAME_LEN));
     let (sink, stream) = framed.split();
-    let (peer, driver) = Peer::new(Box::pin(sink), Box::pin(stream));
-    on_peer(&peer);
-    driver.await;
-    debug!("peerline-uds connection closed");
+    Peer::new(Box::pin(sink), Box::pin(stream))
 }

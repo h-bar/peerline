@@ -1,10 +1,16 @@
-//! WebSocket transport for peerline (axum), for browser clients.
+//! WebSocket transport for peerline. Symmetric — the same text-frame wire
+//! on both ends:
 //!
-//! [`serve`] binds an address, applies permissive CORS, upgrades each
-//! connection to a WebSocket, and drives one [`peerline::runtime::Peer`]
-//! per connection over its text frames — configured by a caller-supplied
-//! handler closure. axum is fully encapsulated here: the caller passes an
-//! address + closure and no axum types cross the boundary.
+//! - [`serve`] (accept side, axum) binds an address, applies permissive
+//!   CORS, upgrades each connection, and drives one
+//!   [`peerline::runtime::Peer`] per connection via a handler closure.
+//!   axum is fully encapsulated: the caller passes an address + closure
+//!   and no axum types cross the boundary.
+//! - [`connect`] (dial side, tokio-tungstenite) dials a `ws://` / `wss://`
+//!   URL and returns one `(Peer, driver)` for the caller to configure.
+//!
+//! peerline is peer-symmetric, so binding vs dialing only decides which
+//! end is addressable — once connected, either peer may issue any frame.
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +21,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use futures::future::BoxFuture;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use peerline::runtime::Peer;
@@ -77,4 +84,45 @@ where
     on_peer(&peer);
     driver.await;
     info!("peerline-ws connection closed");
+}
+
+/// Dial a peerline endpoint at `url` (`ws://host:port` or `wss://…`, the
+/// dial side of [`serve`]) and return one `(Peer, driver)`. Register
+/// handlers on the peer, then drive `driver` to run the session; it
+/// resolves when the socket closes.
+///
+/// A single frame is capped at [`peerline::MAX_FRAME_LEN`], matching the
+/// accept side. Uses `tokio-tungstenite`, so no axum types are involved
+/// on the dial path.
+pub async fn connect(url: &str) -> Result<(Peer, BoxFuture<'static, ()>), String> {
+    use tokio_tungstenite::tungstenite::Message as TMessage;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    // Pin the ceiling to the shared [`peerline::MAX_FRAME_LEN`] rather than
+    // tungstenite's defaults, so the dialer agrees with every acceptor.
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(peerline::MAX_FRAME_LEN))
+        .max_frame_size(Some(peerline::MAX_FRAME_LEN));
+    let (ws, _resp) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
+        .await
+        .map_err(|e| format!("ws connect {url}: {e}"))?;
+    info!(url, "peerline-ws dialed");
+
+    let (ws_sink, ws_stream) = ws.split();
+    let sink = Box::pin(ws_sink.with(|text: String| async move {
+        Ok::<_, tokio_tungstenite::tungstenite::Error>(TMessage::Text(text.into()))
+    }));
+    let stream = Box::pin(ws_stream.filter_map(|frame| async move {
+        match frame {
+            Ok(TMessage::Text(t)) => Some(Ok(t.to_string())),
+            // Tungstenite answers ping/pong at the protocol layer; binary
+            // frames aren't part of the JSON-RPC wire. Drop both rather
+            // than tearing the connection down.
+            Ok(TMessage::Close(_)) => None,
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }));
+    let (peer, driver) = Peer::new(sink, stream);
+    Ok((peer, Box::pin(driver)))
 }

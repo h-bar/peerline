@@ -13,6 +13,10 @@
 //!    ticket back once, and drive a [`peerline::runtime::Peer`] per
 //!    accepted bi-stream, configured by a caller-supplied handler
 //!    closure. [`load_or_create_secret_key`] persists a stable identity.
+//! 4. [`connect`] — the native-Rust dial side: bind an ephemeral
+//!    endpoint, dial a ticket for a given ALPN, and return one
+//!    `(Peer, driver)`. (The `tauri-plugin-peerline-iroh` crate is the
+//!    JS-bridge dial side for Tauri apps; it shares the same framing.)
 //!
 //! The **ALPN is deliberately NOT owned here**: it names a *specific*
 //! service, and one host may run several peerline services behind a
@@ -28,6 +32,7 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 use data_encoding::BASE32_NOPAD;
+use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
@@ -188,6 +193,49 @@ where
     Ok(())
 }
 
+/// Dial the peerline endpoint named by `ticket` for `alpn` (the dial side
+/// of [`serve`]) and return one `(Peer, driver)`. Binds a fresh ephemeral
+/// dialing endpoint, connects, opens ONE bi-stream over the shared text
+/// framing, and hands back a peer for the caller to configure. Drive
+/// `driver` to run the session; it resolves when the stream closes.
+///
+/// The returned driver owns the endpoint and connection, keeping the QUIC
+/// link alive for the peer's lifetime; dropping it closes the link. The
+/// `alpn` must match what the accepting [`serve`] was bound with.
+///
+/// For repeated dials, prefer holding a shared [`Endpoint`] and using it
+/// directly — this helper binds a new endpoint per call, which suits a
+/// one-shot client.
+pub async fn connect(
+    ticket: &str,
+    alpn: &[u8],
+) -> Result<(Peer, BoxFuture<'static, ()>), String> {
+    let addr = decode_ticket(ticket)?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| format!("iroh bind: {e}"))?;
+    let conn = endpoint
+        .connect(addr, alpn)
+        .await
+        .map_err(|e| format!("iroh connect: {e}"))?;
+    // `accept_bi` on the far side only resolves once we send data;
+    // peerline's first client frame does that, so no priming write.
+    let (send, recv) = conn.open_bi().await.map_err(|e| format!("iroh open_bi: {e}"))?;
+    info!(remote = %conn.remote_id(), "peerline-iroh dialed");
+
+    let (sink, stream) = text_frames(tokio::io::join(recv, send));
+    let (peer, driver) = Peer::new(sink, stream);
+    let driver = async move {
+        // Hold the endpoint + connection for the session's lifetime;
+        // dropping either would tear the QUIC link down early.
+        let _endpoint = endpoint;
+        let _conn = conn;
+        driver.await;
+    };
+    Ok((peer, Box::pin(driver)))
+}
+
 /// Drive one accepted connection: each bi-stream the client opens becomes
 /// its own peer session (looping keeps the connection alive across a
 /// reconnect).
@@ -240,5 +288,19 @@ mod tests {
         assert!(decode_ticket("ws://127.0.0.1:6465").is_err());
         assert!(decode_ticket("").is_err());
         assert!(decode_ticket("peerline1!!!notbase32!!!").is_err());
+    }
+
+    // `connect` decodes the ticket before touching the network, so a
+    // foreign ticket fails fast without binding an endpoint — the
+    // dial-side counterpart to `foreign_prefix_is_rejected`.
+    #[tokio::test]
+    async fn connect_rejects_foreign_ticket() {
+        // `Ok` carries a boxed driver (not `Debug`), so match rather than
+        // `unwrap_err`.
+        let err = match connect("ws://127.0.0.1:6465", b"peerline/test/1").await {
+            Ok(_) => panic!("foreign ticket should not connect"),
+            Err(e) => e,
+        };
+        assert!(err.contains(TICKET_PREFIX), "unexpected error: {err}");
     }
 }
