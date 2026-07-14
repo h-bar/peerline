@@ -1,7 +1,7 @@
 [package]
 name = "peerline-transport-uds"
 description = "Unix-domain-socket transport for peerline — a reusable accept-loop (`serve`) that drives a peerline `Peer` per connection over newline-delimited JSON frames. For local tooling on one host."
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT"
 

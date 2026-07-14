@@ -1,7 +1,7 @@
 [package]
 name = "peerline-host"
 description = "Unified multi-service host for peerline — register several `Service`s and serve them all from one binary over WS / UDS / iroh, each mounted under its own name (WS path, UDS socket, iroh ALPN) so their ops never collide. Replaces the per-service `serve` + transport fan-out + shutdown boilerplate."
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT"
 
