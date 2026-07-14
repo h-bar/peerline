@@ -439,7 +439,7 @@ async fn report_loop(
                             "peerline-host: manager report failed; will retry");
         }
         // The connection ended (or never opened) — back off and re-register.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -458,7 +458,22 @@ async fn report_once(
 ) -> Result<(), String> {
     use peerline_manager_protocol::{Heartbeat, METHOD_HEARTBEAT, METHOD_REGISTER, RegisterAck};
 
-    let (peer, driver) = peerline_transport_uds::connect(manager_sock).await?;
+    // Connect, retrying briefly (~1s) so a socket that's about to appear — a
+    // service racing the manager at startup, or our own on self-registration
+    // — is picked up promptly instead of after a full backoff.
+    let (peer, driver) = 'connect: {
+        let mut last = String::new();
+        for _ in 0..20u32 {
+            match peerline_transport_uds::connect(manager_sock).await {
+                Ok(pair) => break 'connect pair,
+                Err(e) => {
+                    last = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+        return Err(last);
+    };
 
     let work = async {
         let ack: RegisterAck =
