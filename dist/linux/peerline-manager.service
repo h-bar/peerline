@@ -1,0 +1,16 @@
+[Unit]
+Description=peerline service manager (registry + web dashboard)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/peerline-manager
+Environment=RUST_LOG=info
+# Canonical defaults are used when unset: uds /tmp/peerline-manager.sock,
+# WS 127.0.0.1:6466, dashboard 127.0.0.1:6467. Override, e.g.:
+# Environment=PEERLINE_MANAGER_WS=0.0.0.0:6466
+# Environment=PEERLINE_MANAGER_UI=0.0.0.0:6467
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
