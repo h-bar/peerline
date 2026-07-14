@@ -2348,6 +2348,7 @@ dependencies = [
  "peerline-transport-uds",
  "peerline-transport-ws",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

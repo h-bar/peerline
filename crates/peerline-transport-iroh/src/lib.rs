@@ -201,6 +201,17 @@ where
         .await
         .map_err(|e| format!("iroh bind: {e}"))?;
 
+    // Wait (bounded) for a direct address before publishing the ticket:
+    // loopback/LAN addresses appear within moments of bind, and a ticket
+    // without them is undialable when no relay is reachable. Fall back to
+    // whatever the endpoint has (relay-only) after the cap so we never hang.
+    for _ in 0..60 {
+        if !endpoint.addr().addrs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     let ticket = encode_ticket(&endpoint.addr())?;
     info!(endpoint_id = %endpoint.id(), mounts = mounts.len(), "peerline-iroh endpoint listening");
     on_ticket(&ticket);

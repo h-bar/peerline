@@ -24,7 +24,13 @@ peerline-transport-uds = { path = "../peerline-transport-uds", optional = true }
 peerline-transport-iroh = { path = "../peerline-transport-iroh", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
-# The WS dial side, for the host integration test.
+serde_json = "1"
+# Dial sides + transport bring-up for the cross-transport conformance suite
+# (`tests/conformance.rs`). These are the same crates the host depends on;
+# naming them here makes them available to the integration tests regardless
+# of which are optional.
 peerline-transport-ws = { path = "../peerline-transport-ws" }
+peerline-transport-uds = { path = "../peerline-transport-uds" }
+peerline-transport-iroh = { path = "../peerline-transport-iroh" }
