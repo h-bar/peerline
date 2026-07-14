@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>peerline manager</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e9ef; --muted: #8b93a7; --accent: #5aa9ff; --ok: #4ec98a;
+    --warn: #e0a43b; --bad: #e05b5b; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 2;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .dot.wait { background: var(--warn); }
+  .spacer { flex: 1; }
+  input, button {
+    font: inherit; color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px;
+  }
+  input { min-width: 260px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .host {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; animation: fade .25s ease;
+  }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+  .host h2 { font-size: 15px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+  .pill { font-size: 11px; color: var(--muted); background: var(--panel2); border: 1px solid var(--line);
+          border-radius: 20px; padding: 1px 8px; }
+  .svc { border-top: 1px solid var(--line); padding: 10px 0 2px; }
+  .svc:first-of-type { margin-top: 8px; }
+  .svc .name { font-weight: 600; margin-bottom: 6px; }
+  .eps { display: flex; flex-direction: column; gap: 5px; }
+  .ep { display: flex; align-items: center; gap: 8px; }
+  .tag { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
+         width: 34px; flex: none; }
+  .tag.ws { color: var(--accent); } .tag.uds { color: var(--ok); } .tag.iroh { color: var(--warn); }
+  code {
+    font-family: var(--mono); font-size: 12px; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px;
+    cursor: copy; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+  }
+  code:hover { border-color: var(--accent); }
+  .empty { color: var(--muted); text-align: center; padding: 60px 0; }
+  .banner { background: rgba(224,91,91,.12); border: 1px solid var(--bad); color: #ffb4b4;
+            border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>peerline <span>manager</span></h1>
+    <span class="status"><span id="dot" class="dot"></span><span id="statusText">disconnected</span></span>
+    <div class="spacer"></div>
+    <input id="url" spellcheck="false" placeholder="ws://host:port/" />
+    <button id="connect">connect</button>
+    <label class="toggle"><input type="checkbox" id="auto" checked style="min-width:auto" /> auto-refresh</label>
+  </header>
+  <main>
+    <div id="banner" class="banner"></div>
+    <div class="meta" id="meta">not connected</div>
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" style="display:none">No hosts registered.</div>
+  </main>
+
+<script>
+// ---- minimal peerline WS client (request/response by id) ------------------
+class Peerline {
+  constructor(url) { this.url = url; this.seq = 0; this.pending = new Map(); }
+  open(onState) {
+    this.onState = onState;
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+    ws.onopen = () => onState("open");
+    ws.onclose = () => { this._failAll("connection closed"); onState("closed"); };
+    ws.onerror = () => onState("error");
+    ws.onmessage = (e) => {
+      let f; try { f = JSON.parse(e.data); } catch { return; }
+      if (f.kind !== "resp") return;
+      const p = this.pending.get(f.id);
+      if (!p) return;
+      this.pending.delete(f.id);
+      f.err ? p.reject(new Error(f.err.msg || "rpc error")) : p.resolve(f.data);
+    };
+  }
+  close() { if (this.ws) this.ws.close(); }
+  call(op, args = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== 1) return reject(new Error("not connected"));
+      const id = ++this.seq;
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ ver: "1", kind: "req", id, op, args }));
+    });
+  }
+  _failAll(msg) { for (const p of this.pending.values()) p.reject(new Error(msg)); this.pending.clear(); }
+}
+
+// ---- dashboard ------------------------------------------------------------
+const WS_PORT = "{{WS_PORT}}"; // injected by the manager binary (may be empty)
+const $ = (id) => document.getElementById(id);
+const urlInput = $("url"), grid = $("grid"), empty = $("empty"),
+      banner = $("banner"), meta = $("meta");
+let client = null, timer = null;
+
+function defaultUrl() {
+  const port = WS_PORT || location.port || "6466";
+  return `ws://${location.hostname || "localhost"}:${port}/`;
+}
+urlInput.value = localStorage.getItem("peerline.manager.url") || defaultUrl();
+
+function setStatus(state) {
+  const dot = $("dot"), text = $("statusText");
+  dot.className = "dot " + ({ open: "ok", connecting: "wait", closed: "bad", error: "bad" }[state] || "");
+  text.textContent = state;
+  if (state === "open") { showError(""); poll(); scheduleAuto(); }
+  if (state === "closed" || state === "error") { clearTimeout(timer); }
+}
+function showError(msg) { banner.style.display = msg ? "block" : "none"; banner.textContent = msg; }
+
+function connect() {
+  if (client) client.close();
+  clearTimeout(timer);
+  const url = urlInput.value.trim();
+  localStorage.setItem("peerline.manager.url", url);
+  setStatus("connecting");
+  client = new Peerline(url);
+  client.open(setStatus);
+}
+
+function scheduleAuto() {
+  clearTimeout(timer);
+  if ($("auto").checked && client && client.ws && client.ws.readyState === 1) {
+    timer = setTimeout(() => poll().finally(scheduleAuto), 2000);
+  }
+}
+
+async function poll() {
+  try {
+    const listing = await client.call("manager.list");
+    render(listing.hosts || []);
+    meta.textContent = `${(listing.hosts || []).length} host(s) · updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) { showError(e.message); }
+}
+
+function copy(text) { navigator.clipboard && navigator.clipboard.writeText(text); }
+
+function chip(kind, value, title) {
+  const ep = document.createElement("div"); ep.className = "ep";
+  const tag = document.createElement("span"); tag.className = "tag " + kind; tag.textContent = kind;
+  const code = document.createElement("code"); code.textContent = value;
+  code.title = (title || value) + "  (click to copy)";
+  code.onclick = () => copy(title || value);
+  ep.append(tag, code); return ep;
+}
+
+function render(hosts) {
+  grid.innerHTML = "";
+  empty.style.display = hosts.length ? "none" : "block";
+  for (const h of hosts) {
+    const card = document.createElement("div"); card.className = "host";
+    const title = document.createElement("h2");
+    title.innerHTML = `${h.host} <span class="pill">pid ${h.pid}</span> <span class="pill">#${h.id}</span>`;
+    card.append(title);
+    for (const s of h.services || []) {
+      const svc = document.createElement("div"); svc.className = "svc";
+      const name = document.createElement("div"); name.className = "name"; name.textContent = s.service;
+      const eps = document.createElement("div"); eps.className = "eps";
+      const e = s.endpoints || {};
+      (e.ws || []).forEach((u) => eps.append(chip("ws", u)));
+      (e.uds || []).forEach((p) => eps.append(chip("uds", p)));
+      (e.iroh || []).forEach((d) => eps.append(chip("iroh", `${d.alpn} · ${d.ticket.slice(0, 16)}…`, d.ticket)));
+      if (!eps.children.length) eps.append(chip("", "(no endpoints)", ""));
+      svc.append(name, eps); card.append(svc);
+    }
+    grid.append(card);
+  }
+}
+
+$("connect").onclick = connect;
+urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+$("auto").addEventListener("change", scheduleAuto);
+connect();
+</script>
+</body>
+</html>

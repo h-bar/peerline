@@ -2358,11 +2358,13 @@ dependencies = [
 name = "peerline-manager"
 version = "0.0.5"
 dependencies = [
+ "axum",
  "futures",
  "peerline",
  "peerline-host",
  "peerline-manager-protocol",
  "peerline-transport-uds",
+ "peerline-transport-ws",
  "serde_json",
  "tokio",
  "tracing",
