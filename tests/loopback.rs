@@ -260,6 +260,52 @@ async fn dropping_stream_receiver_cancels_but_nonsending_handler_completes() {
         .expect("server-side handler should still run after receiver drop");
 }
 
+#[tokio::test]
+async fn parked_stream_handler_completes_on_connection_close() {
+    // A stream handler parked on `cancelled()` that never sends must wake and
+    // finish when the *connection* drops (not just on a graceful receiver
+    // drop) — otherwise it would hang the inbound-loop drain forever and leak
+    // the connection. Built over explicit channels with a separate client
+    // driver so we can kill the client→server pipe.
+    use futures::channel::mpsc;
+    use std::convert::Infallible;
+
+    let (a_to_b_tx, a_to_b_rx) = mpsc::unbounded::<String>();
+    let (b_to_a_tx, b_to_a_rx) = mpsc::unbounded::<String>();
+    let (client, client_driver) = Peer::new(a_to_b_tx, b_to_a_rx.map(Ok::<_, Infallible>));
+    let (server, server_driver) = Peer::new(b_to_a_tx, a_to_b_rx.map(Ok::<_, Infallible>));
+
+    let client_driver = tokio::spawn(client_driver);
+    tokio::spawn(server_driver);
+
+    let started = Arc::new(Notify::new());
+    let done = Arc::new(Notify::new());
+    let (s, d) = (started.clone(), done.clone());
+    server.on_stream_request("hold", move |_: serde_json::Value, sender| {
+        let (s, d) = (s.clone(), d.clone());
+        async move {
+            s.notify_one(); // handler entered
+            sender.cancelled().await; // park until the consumer / connection is gone
+            d.notify_one(); // handler finished
+            Ok::<_, RpcError>(())
+        }
+    });
+
+    // Open the stream and wait until the handler is parked.
+    let _stream: runtime::StreamReceiver<serde_json::Value> =
+        client.call_stream("hold", &json!({})).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("stream handler should start");
+
+    // Hard-close: dropping the client driver drops its outbound sink, so the
+    // server sees EOF. The parked handler must complete promptly.
+    client_driver.abort();
+    tokio::time::timeout(Duration::from_secs(2), done.notified())
+        .await
+        .expect("parked handler must complete on connection close (drain must not hang)");
+}
+
 // ---------------------------------------------------------------------------
 // Peer symmetry — server-initiated calls
 // ---------------------------------------------------------------------------

@@ -201,6 +201,23 @@ impl Outbound {
         }
     }
 
+    /// Cancel every active outbound stream at once — used on connection
+    /// teardown so a handler parked on [`super::StreamSender::cancelled`]
+    /// (or whose next send would block) wakes and returns, instead of
+    /// hanging the inbound-loop drain. Same per-stream effect as
+    /// [`Self::cancel_stream`]. Drains the registry first so the lock is
+    /// released before waking.
+    pub(crate) fn cancel_all(&self) {
+        let handles: Vec<_> =
+            self.streams.lock().unwrap().drain().map(|(_, handle)| handle).collect();
+        for handle in handles {
+            handle.meta.cancelled.store(true, Ordering::Release);
+            handle.meta.cancel_waker.wake();
+            handle.close_tx.close_channel();
+            self.cancelled_streams.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// `(max, total)` queued item count across all active outbound
     /// streams. Backs the per-stream queue metrics.
     pub(crate) fn stream_depths(&self) -> (usize, usize) {

@@ -109,10 +109,11 @@ impl StreamSender {
     }
 
     /// A future that resolves once the consumer cancels this stream
-    /// (drops its [`StreamReceiver`]). Handlers doing expensive
-    /// upstream work can `select!` on this to stop promptly, instead of
-    /// only discovering the cancellation on their next
-    /// [`Self::send_item`] (which returns [`Error::Closed`]):
+    /// (drops its [`StreamReceiver`]) **or the connection is lost** — either
+    /// way the consumer is gone. Handlers doing expensive upstream work can
+    /// `select!` on this to stop promptly, instead of only discovering the
+    /// cancellation on their next [`Self::send_item`] (which returns
+    /// [`Error::Closed`]):
     ///
     /// ```ignore
     /// loop {

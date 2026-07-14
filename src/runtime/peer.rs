@@ -391,12 +391,14 @@ where
     let mut handler_tasks: FuturesUnordered<BoxFuture<'static, Option<Response>>> =
         FuturesUnordered::new();
 
-    loop {
+    let transport_error = loop {
         futures::select! {
             // New inbound frame
             item = inbound.next() => match item {
                 Some(Ok(text)) => on_inbound_text(&inner, &text, &mut handler_tasks),
-                Some(Err(_)) | None => break,
+                // Clean EOF (peer closed) vs a transport/decode error.
+                None => break false,
+                Some(Err(_)) => break true,
             },
             // A handler finished — send its response back if it produced one
             done = handler_tasks.select_next_some() => {
@@ -405,12 +407,22 @@ where
                 }
             }
         }
-    }
+    };
 
-    // Drain any still-running handlers so their responses get sent.
-    while let Some(done) = handler_tasks.next().await {
-        if let Some(response) = done {
-            let _ = send_frame(&inner, response);
+    // The peer is gone: wake every active outbound stream's `cancelled()` so
+    // handlers parked on it (or a subscription awaiting a disconnect) finish
+    // instead of hanging the drain below forever.
+    inner.outbound.cancel_all();
+
+    // On a clean half-close the writer is still up, so drain in-flight
+    // handlers to flush their responses. On a transport error the writer is
+    // dead — responses can't be delivered — so skip the drain; dropping the
+    // handler tasks (with the cancel above) releases them promptly.
+    if !transport_error {
+        while let Some(done) = handler_tasks.next().await {
+            if let Some(response) = done {
+                let _ = send_frame(&inner, response);
+            }
         }
     }
 
