@@ -1,12 +1,13 @@
 ## Default Permission
 
-Allows dialing, framing, and closing a peerline-over-Iroh P2P transport, and decoding/probing a ticket.
+Allows dialing, framing, closing, and inspecting a peerline-over-Iroh P2P transport, plus decoding/probing a ticket.
 
 #### This default permission set includes the following:
 
 - `allow-connect`
 - `allow-send`
 - `allow-close`
+- `allow-connection-status`
 - `allow-inspect-ticket`
 - `allow-probe-ticket`
 
@@ -67,6 +68,32 @@ Enables the connect command without any pre-configured scope.
 <td>
 
 Denies the connect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`peerline-iroh:allow-connection-status`
+
+</td>
+<td>
+
+Enables the connection_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`peerline-iroh:deny-connection-status`
+
+</td>
+<td>
+
+Denies the connection_status command without any pre-configured scope.
 
 </td>
 </tr>

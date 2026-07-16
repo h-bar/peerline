@@ -62,6 +62,66 @@ struct DecodedTicket {
     direct_addrs: Vec<String>,
 }
 
+/// One QUIC path of a live connection, with its per-path stats.
+#[derive(Clone, serde::Serialize)]
+struct PathInfo {
+    /// `"relay"` (via a relay server) or `"direct"` (a UDP path), or `"other"`.
+    kind: String,
+    /// The path's remote address — the **relay URL** for a relay path, or the
+    /// peer's **ip:port** for a direct path.
+    remote_addr: String,
+    /// Our local side of the path (best-effort: local IP for a direct path,
+    /// the relay URL for a relay path).
+    local_addr: String,
+    /// True if this path is the one currently carrying application data.
+    selected: bool,
+    /// Round-trip time estimate for this path, in ms.
+    rtt_ms: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    datagrams_sent: u64,
+    datagrams_recv: u64,
+    /// Congestion window (bytes) and cumulative congestion events.
+    cwnd: u64,
+    congestion_events: u64,
+}
+
+/// A detailed snapshot of a live iroh connection — the "connection status" the
+/// UI shows: whether traffic is going over the relay (remote) or a direct path
+/// (local), the concrete relay URL / ip:port in use, latency, per-path stats,
+/// and connection totals.
+#[derive(Clone, serde::Serialize)]
+struct ConnectionStatus {
+    /// The `connect` handle id this status is for.
+    id: u64,
+    /// The peer's identity (its public key / endpoint id), hex.
+    remote_id: String,
+    /// The negotiated ALPN (service id), if any.
+    alpn: Option<String>,
+    /// `"client"` (we dialed) — always, for this plugin.
+    side: String,
+    /// Headline: `"local"` if the selected path is direct, `"remote"` if it's
+    /// the relay, or `"connecting"` if no path is selected yet.
+    connection_type: String,
+    /// The selected path's remote address — the relay URL, or the peer ip:port.
+    active_remote: Option<String>,
+    /// Round-trip time of the selected path, in ms.
+    rtt_ms: Option<u64>,
+    /// Max QUIC datagram size for this connection, if known.
+    max_datagram_size: Option<usize>,
+    /// Every open path (relay + any direct), each with its own stats.
+    paths: Vec<PathInfo>,
+    /// Connection-wide byte / datagram totals and loss counters.
+    bytes_sent: u64,
+    bytes_recv: u64,
+    datagrams_sent: u64,
+    datagrams_recv: u64,
+    lost_packets: u64,
+    lost_bytes: u64,
+    /// Set once the connection has closed (the close reason).
+    closed: Option<String>,
+}
+
 /// One target's reachability result — whether the peer is reachable over that
 /// single relay (or single direct address), and how long reaching it took.
 #[derive(Clone, serde::Serialize)]
@@ -98,6 +158,11 @@ struct TicketProbe {
 struct Conn {
     tx: mpsc::UnboundedSender<String>,
     abort: tokio::task::AbortHandle,
+    /// A clone of the live QUIC connection, so `connection_status` can read
+    /// its current paths / RTT / stats. `Connection` is cheap to clone (an
+    /// `Arc` inside) and dropping this clone with the entry doesn't close the
+    /// link while the pump still holds its own.
+    conn: iroh::endpoint::Connection,
 }
 
 /// Plugin state: one shared dialing endpoint (built lazily) plus the
@@ -189,8 +254,9 @@ async fn connect<R: Runtime>(
     // can't remove the entry before we insert it (which would leak a live
     // handle). No await runs while the lock is held.
     let mut conns = state.conns();
+    let conn_for_status = conn.clone();
     let handle = tokio::spawn(pump(app.clone(), id, conn, send, recv, on_frame, rx));
-    conns.insert(id, Conn { tx, abort: handle.abort_handle() });
+    conns.insert(id, Conn { tx, abort: handle.abort_handle(), conn: conn_for_status });
     drop(conns);
     Ok(ConnectResult { id })
 }
@@ -210,6 +276,80 @@ fn close<R: Runtime>(app: AppHandle<R>, id: u64) {
     if let Some(conn) = app.state::<IrohState>().conns().remove(&id) {
         conn.abort.abort();
     }
+}
+
+/// Detailed live status of connection `id`: whether it's on the relay (remote)
+/// or a direct path (local), the concrete relay URL / peer ip:port in use,
+/// latency, per-path stats, and connection totals. Read on demand (or polled)
+/// by the UI. Errors if `id` isn't a live connection.
+#[command]
+fn connection_status<R: Runtime>(app: AppHandle<R>, id: u64) -> Result<ConnectionStatus, String> {
+    let state = app.state::<IrohState>();
+    let conns = state.conns();
+    let conn = &conns.get(&id).ok_or("unknown iroh connection")?.conn;
+
+    let mut paths = Vec::new();
+    let mut connection_type = "connecting".to_string();
+    let mut active_remote = None;
+    let mut rtt_ms = None;
+    for p in conn.paths().iter() {
+        let is_relay = p.is_relay();
+        let kind = if is_relay {
+            "relay"
+        } else if p.is_ip() {
+            "direct"
+        } else {
+            "other"
+        };
+        // `TransportAddr` Display is `relay:<url>` / `ip:<addr:port>`; strip the
+        // kind prefix (only the first colon) to leave the bare URL / ip:port.
+        let raw = p.remote_addr().to_string();
+        let remote_addr = raw.split_once(':').map(|(_, r)| r.to_string()).unwrap_or(raw);
+        let st = p.stats();
+        let path_rtt = st.rtt.as_millis() as u64;
+        if p.is_selected() {
+            connection_type = if is_relay { "remote" } else { "local" }.to_string();
+            active_remote = Some(remote_addr.clone());
+            rtt_ms = Some(path_rtt);
+        }
+        paths.push(PathInfo {
+            kind: kind.to_string(),
+            remote_addr,
+            local_addr: format!("{:?}", p.local_addr()),
+            selected: p.is_selected(),
+            rtt_ms: path_rtt,
+            bytes_sent: st.udp_tx.bytes,
+            bytes_recv: st.udp_rx.bytes,
+            datagrams_sent: st.udp_tx.datagrams,
+            datagrams_recv: st.udp_rx.datagrams,
+            cwnd: st.cwnd,
+            congestion_events: st.congestion_events,
+        });
+    }
+
+    let s = conn.stats();
+    let alpn = match conn.alpn() {
+        a if a.is_empty() => None,
+        a => Some(String::from_utf8_lossy(a).into_owned()),
+    };
+    Ok(ConnectionStatus {
+        id,
+        remote_id: conn.remote_id().to_string(),
+        alpn,
+        side: if conn.side().is_client() { "client" } else { "server" }.to_string(),
+        connection_type,
+        active_remote,
+        rtt_ms,
+        max_datagram_size: conn.max_datagram_size(),
+        paths,
+        bytes_sent: s.udp_tx.bytes,
+        bytes_recv: s.udp_rx.bytes,
+        datagrams_sent: s.udp_tx.datagrams,
+        datagrams_recv: s.udp_rx.datagrams,
+        lost_packets: s.lost_packets,
+        lost_bytes: s.lost_bytes,
+        closed: conn.close_reason().map(|e| e.to_string()),
+    })
 }
 
 /// Decode a peerline ticket into its parts WITHOUT dialing — endpoint id,
@@ -368,7 +508,14 @@ async fn pump<R: Runtime>(
 /// dials (the acceptor bakes its relay into the ticket).
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("peerline-iroh")
-        .invoke_handler(tauri::generate_handler![connect, send, close, inspect_ticket, probe_ticket])
+        .invoke_handler(tauri::generate_handler![
+            connect,
+            send,
+            close,
+            connection_status,
+            inspect_ticket,
+            probe_ticket
+        ])
         .setup(|app, _api| {
             app.manage(IrohState::default());
             Ok(())
