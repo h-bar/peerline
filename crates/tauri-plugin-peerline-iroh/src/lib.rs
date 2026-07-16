@@ -143,7 +143,7 @@ impl IrohState {
             }
         }
         let mut builder = Endpoint::builder(presets::N0);
-        if let Some(relay_mode) = (IrohConfig { relays: want.clone() }).relay_mode() {
+        if let Some(relay_mode) = (IrohConfig { relays: want.clone(), ..Default::default() }).relay_mode() {
             builder = builder.relay_mode(relay_mode);
         }
         let e = builder
@@ -246,7 +246,7 @@ async fn probe_ticket(ticket: String) -> Result<TicketProbe, String> {
     // to just that relay.
     let relay_probes = addr.relay_urls().cloned().map(|url| {
         let single = EndpointAddr::from(id).with_relay_url(url.clone());
-        let mode = (IrohConfig { relays: vec![url.clone()] }).relay_mode();
+        let mode = (IrohConfig { relays: vec![url.clone()], ..Default::default() }).relay_mode();
         probe_path(single, mode, Duration::from_secs(12), url.to_string())
     });
 

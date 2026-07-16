@@ -164,6 +164,14 @@ pub struct IrohConfig {
     /// `http://relay.example:3340`. The acceptor's home relay becomes the
     /// first reachable one, and the ticket advertises it so dialers adopt it.
     pub relays: Vec<RelayUrl>,
+    /// UDP port the acceptor binds on all interfaces. `None` (or `Some(0)`) ⇒
+    /// an ephemeral port, which the OS re-picks on every restart — so a
+    /// ticket's **direct** addresses go stale across restarts (the relay and
+    /// endpoint identity stay valid regardless). Set a fixed port to keep the
+    /// direct addresses valid across restarts (and to make port-forwarding /
+    /// firewall rules stable). Only the acceptor needs this — dialers always
+    /// use an ephemeral local port.
+    pub bind_port: Option<u16>,
 }
 
 impl IrohConfig {
@@ -188,7 +196,7 @@ impl IrohConfig {
             }
         }
         if bad.is_empty() {
-            Ok(Self { relays })
+            Ok(Self { relays, bind_port: None })
         } else {
             Err(format!("invalid iroh relay url(s): {}", bad.join(", ")))
         }
@@ -266,6 +274,19 @@ where
     if let Some(relay_mode) = config.relay_mode() {
         info!(relays = config.relays.len(), "peerline-iroh: using custom relay(s)");
         builder = builder.relay_mode(relay_mode);
+    }
+    // Bind a fixed UDP port (all interfaces) if configured, so the ticket's
+    // direct addresses survive restarts. Replace iroh's default ephemeral
+    // v4/v6 sockets rather than adding to them. `0` binds ephemeral, matching
+    // the `None` default.
+    if let Some(port) = config.bind_port {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::UNSPECIFIED, port))
+            .map_err(|e| format!("iroh bind v4 :{port}: {e}"))?
+            .bind_addr((Ipv6Addr::UNSPECIFIED, port))
+            .map_err(|e| format!("iroh bind v6 :{port}: {e}"))?;
     }
     let endpoint = builder
         .bind()
@@ -353,7 +374,7 @@ pub async fn connect(
     let addr = decode_ticket(ticket)?;
     let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
     let mut builder = Endpoint::builder(presets::N0);
-    if let Some(relay_mode) = (IrohConfig { relays }).relay_mode() {
+    if let Some(relay_mode) = (IrohConfig { relays, ..Default::default() }).relay_mode() {
         builder = builder.relay_mode(relay_mode);
     }
     let endpoint = builder

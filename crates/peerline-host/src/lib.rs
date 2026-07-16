@@ -137,6 +137,7 @@ pub struct Host {
     ws_bind: Option<SocketAddr>,
     iroh_key: Option<Option<PathBuf>>,
     iroh_relays: Vec<String>,
+    iroh_port: Option<u16>,
     report: ReportMode,
 }
 
@@ -178,6 +179,18 @@ impl Host {
     #[must_use]
     pub fn iroh_relay(mut self, url: impl Into<String>) -> Self {
         self.iroh_relays.push(url.into());
+        self
+    }
+
+    /// Bind the shared iroh endpoint on a fixed UDP port (all interfaces)
+    /// instead of an ephemeral one. A fixed port keeps a ticket's direct
+    /// addresses valid across restarts (an ephemeral port is re-picked each
+    /// boot, so old tickets' direct addresses go stale — the relay and
+    /// identity stay valid regardless). `0` means ephemeral. Only takes effect
+    /// with an [`Host::iroh_endpoint`].
+    #[must_use]
+    pub fn iroh_port(mut self, port: u16) -> Self {
+        self.iroh_port = Some(port);
         self
     }
 
@@ -309,6 +322,7 @@ impl Host {
                 serves.push(iroh_serve(
                     key_path.clone(),
                     self.iroh_relays.clone(),
+                    self.iroh_port,
                     mounts,
                     dials,
                     ticket_tx,
@@ -381,14 +395,16 @@ fn uds_serve(_: Vec<(PathBuf, PeerHandler)>) -> Result<Serve, String> {
 fn iroh_serve(
     key_path: Option<PathBuf>,
     relays: Vec<String>,
+    port: Option<u16>,
     mounts: Vec<(Vec<u8>, PeerHandler)>,
     dials: Vec<(String, String)>,
     ticket_tx: Option<oneshot::Sender<String>>,
 ) -> Result<Serve, String> {
     let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
         .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
-    let config = peerline_transport_iroh::IrohConfig::from_relay_urls(relays)
+    let mut config = peerline_transport_iroh::IrohConfig::from_relay_urls(relays)
         .map_err(|e| format!("peerline-host: iroh relay: {e}"))?;
+    config.bind_port = port;
     let serve = peerline_transport_iroh::serve_mounted(
         key,
         config,
@@ -425,6 +441,7 @@ fn iroh_serve(
 fn iroh_serve(
     _: Option<PathBuf>,
     _: Vec<String>,
+    _: Option<u16>,
     _: Vec<(Vec<u8>, PeerHandler)>,
     _: Vec<(String, String)>,
     _: Option<oneshot::Sender<String>>,
