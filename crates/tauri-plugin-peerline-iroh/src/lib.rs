@@ -18,7 +18,6 @@
 //! - `close(id)` → tears the connection down (idempotent).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -63,41 +62,34 @@ struct DecodedTicket {
     direct_addrs: Vec<String>,
 }
 
-/// One path's reachability result — whether that path can deliver to the peer,
-/// and how long reaching it took.
+/// One target's reachability result — whether the peer is reachable over that
+/// single relay (or single direct address), and how long reaching it took.
 #[derive(Clone, serde::Serialize)]
 struct PathProbe {
-    /// The targets this path tried (relay URL(s), or IP addr(s)).
-    targets: Vec<String>,
-    /// Did this path reach the peer within the timeout? True on a completed
+    /// The single relay URL or IP address this result is for.
+    target: String,
+    /// Did this target reach the peer within the timeout? True on a completed
     /// handshake AND on a peer-side refusal (the probe uses a neutral ALPN the
     /// service rejects — reaching that rejection still proves the path
-    /// delivered). False only when the path never got through (timeout / no
-    /// route / no such path in the ticket).
+    /// delivered). False only when it never got through (timeout / no route).
     reachable: bool,
-    /// Wall-clock ms to reach the peer — the path's latency signal (relay hop
-    /// shows higher; LAN direct shows low). `None` when unreachable.
+    /// Wall-clock ms to reach the peer — the target's latency signal (relay
+    /// hop shows higher; LAN direct shows low). `None` when unreachable.
     latency_ms: Option<u64>,
     /// Human-readable outcome: `connected`, the peer's refusal, or the error.
     detail: String,
 }
 
-impl PathProbe {
-    fn absent(reason: &str) -> Self {
-        Self { targets: vec![], reachable: false, latency_ms: None, detail: reason.into() }
-    }
-}
-
 /// [`inspect_ticket`] plus a live reachability + latency test of the peer over
-/// each path **separately** — the direct addresses only, and the relay only —
-/// so the frontend sees which paths work and how fast, from one call.
+/// **each relay and each direct address individually**, so the frontend sees
+/// exactly which targets work and how fast, from one call.
 #[derive(Clone, serde::Serialize)]
 struct TicketProbe {
     endpoint_id: String,
-    /// Reaching the peer over its **relay** only.
-    relay: PathProbe,
-    /// Reaching the peer over its **direct** addresses only (relay disabled).
-    direct: PathProbe,
+    /// One result per relay URL in the ticket (empty if it carries none).
+    relays: Vec<PathProbe>,
+    /// One result per direct address in the ticket (empty if it carries none).
+    direct_addrs: Vec<PathProbe>,
 }
 
 /// A live connection's control surface: outbound frames go through
@@ -239,64 +231,51 @@ fn inspect_ticket(ticket: String) -> Result<DecodedTicket, String> {
 /// still proves the path delivered to the peer, which is what we're testing.
 const PROBE_ALPN: &[u8] = b"peerline/probe/1";
 
-/// Decode a ticket AND test each path to the peer separately: the **relay**
-/// only, and the **direct** addresses only (relay disabled), reporting
-/// reachability + latency for each. Takes only the ticket — no ALPN needed, it
-/// probes at the path level. Binds throwaway endpoints, independent of the
-/// live dialing endpoint, so it never disturbs a real session.
+/// Decode a ticket AND test every relay and every direct address the ticket
+/// carries **individually** — each over just that one target — reporting
+/// reachability + latency per target. Takes only the ticket (probes at the
+/// path level, no ALPN needed). All targets are probed concurrently on
+/// throwaway endpoints, independent of the live dialing endpoint, so it never
+/// disturbs a real session.
 #[command]
 async fn probe_ticket(ticket: String) -> Result<TicketProbe, String> {
     let addr = decode_ticket(&ticket)?;
+    let id = addr.id;
 
-    // Relay-only: a ticket-addr with just the relay hint(s), relay mode set to
-    // exactly those relays.
-    let relay_urls: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
-    let relay = if relay_urls.is_empty() {
-        PathProbe::absent("ticket carries no relay")
-    } else {
-        let relay_addr = relay_urls
-            .iter()
-            .fold(EndpointAddr::from(addr.id), |a, u| a.with_relay_url(u.clone()));
-        let mode = (IrohConfig { relays: relay_urls.clone() }).relay_mode();
-        probe_path(
-            relay_addr,
-            mode,
-            Duration::from_secs(12),
-            relay_urls.iter().map(|u| u.to_string()).collect(),
-        )
-        .await
-    };
+    // One probe per relay: a ticket-addr with just that relay, relay mode set
+    // to just that relay.
+    let relay_probes = addr.relay_urls().cloned().map(|url| {
+        let single = EndpointAddr::from(id).with_relay_url(url.clone());
+        let mode = (IrohConfig { relays: vec![url.clone()] }).relay_mode();
+        probe_path(single, mode, Duration::from_secs(12), url.to_string())
+    });
 
-    // Direct-only: a ticket-addr with just the IP hint(s), relay DISABLED so
-    // the only path iroh can use is a direct one.
-    let ips: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
-    let direct = if ips.is_empty() {
-        PathProbe::absent("ticket carries no direct addresses")
-    } else {
-        let direct_addr = ips
-            .iter()
-            .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip));
-        probe_path(
-            direct_addr,
-            Some(RelayMode::Disabled),
-            Duration::from_secs(8),
-            ips.iter().map(|a| a.to_string()).collect(),
-        )
-        .await
-    };
+    // One probe per direct address: a ticket-addr with just that IP, relay
+    // DISABLED so the only path iroh can use is that direct one.
+    let direct_probes = addr.ip_addrs().copied().map(|ip| {
+        let single = EndpointAddr::from(id).with_ip_addr(ip);
+        probe_path(single, Some(RelayMode::Disabled), Duration::from_secs(8), ip.to_string())
+    });
 
-    Ok(TicketProbe { endpoint_id: addr.id.to_string(), relay, direct })
+    // Run them all concurrently so timeouts don't stack.
+    let (relays, direct_addrs) = futures::future::join(
+        futures::future::join_all(relay_probes),
+        futures::future::join_all(direct_probes),
+    )
+    .await;
+
+    Ok(TicketProbe { endpoint_id: id.to_string(), relays, direct_addrs })
 }
 
 /// Bind a throwaway endpoint (optionally overriding the relay mode), try to
-/// reach `addr` over that path with [`PROBE_ALPN`], measure how long it took,
-/// then close. Reaching the peer — even a peer-side ALPN refusal — counts as
-/// reachable; only a dead path (timeout / no route) is unreachable.
+/// reach `addr` over its single `target` with [`PROBE_ALPN`], measure how long
+/// it took, then close. Reaching the peer — even a peer-side ALPN refusal —
+/// counts as reachable; only a dead path (timeout / no route) is unreachable.
 async fn probe_path(
     addr: EndpointAddr,
     relay_mode: Option<RelayMode>,
     timeout: Duration,
-    targets: Vec<String>,
+    target: String,
 ) -> PathProbe {
     let start = Instant::now();
     let mut builder = Endpoint::builder(presets::N0);
@@ -305,7 +284,7 @@ async fn probe_path(
     }
     let endpoint = match builder.bind().await {
         Ok(e) => e,
-        Err(e) => return PathProbe { targets, reachable: false, latency_ms: None, detail: format!("bind: {e}") },
+        Err(e) => return PathProbe { target, reachable: false, latency_ms: None, detail: format!("bind: {e}") },
     };
     let outcome = tokio::time::timeout(timeout, endpoint.connect(addr, PROBE_ALPN)).await;
     endpoint.close().await;
@@ -314,7 +293,7 @@ async fn probe_path(
         // Unlikely (the peer would have to serve the probe ALPN), but a clean
         // reach nonetheless.
         Ok(Ok(_conn)) => {
-            PathProbe { targets, reachable: true, latency_ms: Some(ms), detail: "connected".into() }
+            PathProbe { target, reachable: true, latency_ms: Some(ms), detail: "connected".into() }
         }
         Ok(Err(e)) => {
             let msg = e.to_string();
@@ -325,12 +304,12 @@ async fn probe_path(
                 .iter()
                 .any(|k| low.contains(k));
             if dead {
-                PathProbe { targets, reachable: false, latency_ms: None, detail: msg }
+                PathProbe { target, reachable: false, latency_ms: None, detail: msg }
             } else {
-                PathProbe { targets, reachable: true, latency_ms: Some(ms), detail: format!("reached peer (probe ALPN refused): {msg}") }
+                PathProbe { target, reachable: true, latency_ms: Some(ms), detail: format!("reached peer (probe ALPN refused): {msg}") }
             }
         }
-        Err(_) => PathProbe { targets, reachable: false, latency_ms: None, detail: "timed out".into() },
+        Err(_) => PathProbe { target, reachable: false, latency_ms: None, detail: "timed out".into() },
     }
 }
 
