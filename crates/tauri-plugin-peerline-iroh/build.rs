@@ -1,4 +1,4 @@
-const COMMANDS: &[&str] = &["connect", "send", "close"];
+const COMMANDS: &[&str] = &["connect", "send", "close", "inspect_ticket", "probe_ticket"];
 
 fn main() {
     // Autogenerates one `allow-<cmd>` / `deny-<cmd>` permission per

@@ -18,14 +18,16 @@
 //! - `close(id)` → tears the connection down (idempotent).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use iroh::endpoint::presets;
-use iroh::Endpoint;
-use peerline_transport_iroh::{decode_ticket, text_frames, IrohConfig, RelayUrl};
+use iroh::{Endpoint, RelayMode};
+use peerline_transport_iroh::{decode_ticket, text_frames, EndpointAddr, IrohConfig, RelayUrl};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{command, AppHandle, Manager, Runtime};
@@ -46,6 +48,56 @@ enum Inbound {
 #[derive(Clone, serde::Serialize)]
 struct ConnectResult {
     id: u64,
+}
+
+/// The decoded parts of a peerline ticket, for on-device inspection — e.g.
+/// confirming a ticket actually carries the expected relay when there's no
+/// console to read.
+#[derive(Clone, serde::Serialize)]
+struct DecodedTicket {
+    /// The endpoint's identity (its public key / `EndpointId`), hex.
+    endpoint_id: String,
+    /// Relay URL(s) the ticket advertises — the relay(s) a dialer adopts.
+    relays: Vec<String>,
+    /// Direct IP address hints carried by the ticket (LAN/loopback/public).
+    direct_addrs: Vec<String>,
+}
+
+/// One path's reachability result — whether that path can deliver to the peer,
+/// and how long reaching it took.
+#[derive(Clone, serde::Serialize)]
+struct PathProbe {
+    /// The targets this path tried (relay URL(s), or IP addr(s)).
+    targets: Vec<String>,
+    /// Did this path reach the peer within the timeout? True on a completed
+    /// handshake AND on a peer-side refusal (the probe uses a neutral ALPN the
+    /// service rejects — reaching that rejection still proves the path
+    /// delivered). False only when the path never got through (timeout / no
+    /// route / no such path in the ticket).
+    reachable: bool,
+    /// Wall-clock ms to reach the peer — the path's latency signal (relay hop
+    /// shows higher; LAN direct shows low). `None` when unreachable.
+    latency_ms: Option<u64>,
+    /// Human-readable outcome: `connected`, the peer's refusal, or the error.
+    detail: String,
+}
+
+impl PathProbe {
+    fn absent(reason: &str) -> Self {
+        Self { targets: vec![], reachable: false, latency_ms: None, detail: reason.into() }
+    }
+}
+
+/// [`inspect_ticket`] plus a live reachability + latency test of the peer over
+/// each path **separately** — the direct addresses only, and the relay only —
+/// so the frontend sees which paths work and how fast, from one call.
+#[derive(Clone, serde::Serialize)]
+struct TicketProbe {
+    endpoint_id: String,
+    /// Reaching the peer over its **relay** only.
+    relay: PathProbe,
+    /// Reaching the peer over its **direct** addresses only (relay disabled).
+    direct: PathProbe,
 }
 
 /// A live connection's control surface: outbound frames go through
@@ -168,6 +220,120 @@ fn close<R: Runtime>(app: AppHandle<R>, id: u64) {
     }
 }
 
+/// Decode a peerline ticket into its parts WITHOUT dialing — endpoint id,
+/// relay URL(s), and direct address hints. Purely local (decodes the ticket
+/// bytes); a diagnostic for confirming, on a device, what a ticket actually
+/// carries (e.g. whether the custom relay made it in).
+#[command]
+fn inspect_ticket(ticket: String) -> Result<DecodedTicket, String> {
+    let addr = decode_ticket(&ticket)?;
+    Ok(DecodedTicket {
+        endpoint_id: addr.id.to_string(),
+        relays: addr.relay_urls().map(|u| u.to_string()).collect(),
+        direct_addrs: addr.ip_addrs().map(|a| a.to_string()).collect(),
+    })
+}
+
+/// A neutral ALPN used only for reachability probing. A real service won't
+/// serve it, so the peer refuses the handshake — but reaching that refusal
+/// still proves the path delivered to the peer, which is what we're testing.
+const PROBE_ALPN: &[u8] = b"peerline/probe/1";
+
+/// Decode a ticket AND test each path to the peer separately: the **relay**
+/// only, and the **direct** addresses only (relay disabled), reporting
+/// reachability + latency for each. Takes only the ticket — no ALPN needed, it
+/// probes at the path level. Binds throwaway endpoints, independent of the
+/// live dialing endpoint, so it never disturbs a real session.
+#[command]
+async fn probe_ticket(ticket: String) -> Result<TicketProbe, String> {
+    let addr = decode_ticket(&ticket)?;
+
+    // Relay-only: a ticket-addr with just the relay hint(s), relay mode set to
+    // exactly those relays.
+    let relay_urls: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
+    let relay = if relay_urls.is_empty() {
+        PathProbe::absent("ticket carries no relay")
+    } else {
+        let relay_addr = relay_urls
+            .iter()
+            .fold(EndpointAddr::from(addr.id), |a, u| a.with_relay_url(u.clone()));
+        let mode = (IrohConfig { relays: relay_urls.clone() }).relay_mode();
+        probe_path(
+            relay_addr,
+            mode,
+            Duration::from_secs(12),
+            relay_urls.iter().map(|u| u.to_string()).collect(),
+        )
+        .await
+    };
+
+    // Direct-only: a ticket-addr with just the IP hint(s), relay DISABLED so
+    // the only path iroh can use is a direct one.
+    let ips: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
+    let direct = if ips.is_empty() {
+        PathProbe::absent("ticket carries no direct addresses")
+    } else {
+        let direct_addr = ips
+            .iter()
+            .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip));
+        probe_path(
+            direct_addr,
+            Some(RelayMode::Disabled),
+            Duration::from_secs(8),
+            ips.iter().map(|a| a.to_string()).collect(),
+        )
+        .await
+    };
+
+    Ok(TicketProbe { endpoint_id: addr.id.to_string(), relay, direct })
+}
+
+/// Bind a throwaway endpoint (optionally overriding the relay mode), try to
+/// reach `addr` over that path with [`PROBE_ALPN`], measure how long it took,
+/// then close. Reaching the peer — even a peer-side ALPN refusal — counts as
+/// reachable; only a dead path (timeout / no route) is unreachable.
+async fn probe_path(
+    addr: EndpointAddr,
+    relay_mode: Option<RelayMode>,
+    timeout: Duration,
+    targets: Vec<String>,
+) -> PathProbe {
+    let start = Instant::now();
+    let mut builder = Endpoint::builder(presets::N0);
+    if let Some(mode) = relay_mode {
+        builder = builder.relay_mode(mode);
+    }
+    let endpoint = match builder.bind().await {
+        Ok(e) => e,
+        Err(e) => return PathProbe { targets, reachable: false, latency_ms: None, detail: format!("bind: {e}") },
+    };
+    let outcome = tokio::time::timeout(timeout, endpoint.connect(addr, PROBE_ALPN)).await;
+    endpoint.close().await;
+    let ms = start.elapsed().as_millis() as u64;
+    match outcome {
+        // Unlikely (the peer would have to serve the probe ALPN), but a clean
+        // reach nonetheless.
+        Ok(Ok(_conn)) => {
+            PathProbe { targets, reachable: true, latency_ms: Some(ms), detail: "connected".into() }
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let low = msg.to_lowercase();
+            // A dead path never delivers; anything else means the peer itself
+            // responded (e.g. refused the probe ALPN) — so the path works.
+            let dead = ["timed out", "timeout", "no route", "unreachable", "no known", "no working", "no path", "no addr"]
+                .iter()
+                .any(|k| low.contains(k));
+            if dead {
+                PathProbe { targets, reachable: false, latency_ms: None, detail: msg }
+            } else {
+                PathProbe { targets, reachable: true, latency_ms: Some(ms), detail: format!("reached peer (probe ALPN refused): {msg}") }
+            }
+        }
+        Err(_) => PathProbe { targets, reachable: false, latency_ms: None, detail: "timed out".into() },
+    }
+}
+
 /// Drive one bi-stream: pump inbound frames → `channel` and outbound
 /// frames ← `rx` over the shared text-frame codec, emitting exactly one
 /// terminal `Close` when either direction ends. `_conn` is held only to
@@ -223,7 +389,7 @@ async fn pump<R: Runtime>(
 /// dials (the acceptor bakes its relay into the ticket).
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("peerline-iroh")
-        .invoke_handler(tauri::generate_handler![connect, send, close])
+        .invoke_handler(tauri::generate_handler![connect, send, close, inspect_ticket, probe_ticket])
         .setup(|app, _api| {
             app.manage(IrohState::default());
             Ok(())

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-probe-ticket"
+description = "Enables the probe_ticket command without any pre-configured scope."
+commands.allow = ["probe_ticket"]
+
+[[permission]]
+identifier = "deny-probe-ticket"
+description = "Denies the probe_ticket command without any pre-configured scope."
+commands.deny = ["probe_ticket"]
