@@ -37,13 +37,13 @@ use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::Endpoint;
+use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode};
 use peerline::runtime::Peer;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
-pub use iroh_base::{EndpointAddr, SecretKey};
+pub use iroh_base::{EndpointAddr, RelayUrl, SecretKey};
 
 /// Human-facing ticket prefix — service-neutral, so every peerline-iroh
 /// ticket is recognizable at a glance and cannot be confused with a
@@ -150,6 +150,72 @@ fn write_secret_key(path: &Path, bytes: &[u8]) -> io::Result<()> {
     opts.open(path)?.write_all(bytes)
 }
 
+/// iroh **acceptor** settings ([`serve`] / [`serve_mounted`]). Passed in by
+/// the caller — never read from the environment — so a consuming app owns how
+/// it is sourced (its own config file, etc.). Only the acceptor needs this:
+/// it configures the relay it binds to, which is then baked into the ticket.
+/// **Dialers ([`connect`], the tauri dial plugin) take no relay config** —
+/// they adopt the relay carried by the ticket they dial (see [`connect`]).
+#[derive(Clone, Default, Debug)]
+pub struct IrohConfig {
+    /// Custom relay servers. Empty ⇒ the n0 default relays. A self-hosted
+    /// relay is what makes peerline reachable where the n0 public relays are
+    /// distant or unreliable and direct connectivity is impossible, e.g.
+    /// `http://relay.example:3340`. The acceptor's home relay becomes the
+    /// first reachable one, and the ticket advertises it so dialers adopt it.
+    pub relays: Vec<RelayUrl>,
+}
+
+impl IrohConfig {
+    /// Build from relay URL strings (e.g. config-file values), returning an
+    /// error that names every entry which isn't a valid relay URL. Empty and
+    /// whitespace-only entries are skipped.
+    pub fn from_relay_urls<I, S>(urls: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut relays = Vec::new();
+        let mut bad = Vec::new();
+        for u in urls {
+            let s = u.as_ref().trim();
+            if s.is_empty() {
+                continue;
+            }
+            match s.parse::<RelayUrl>() {
+                Ok(url) => relays.push(url),
+                Err(_) => bad.push(s.to_string()),
+            }
+        }
+        if bad.is_empty() {
+            Ok(Self { relays })
+        } else {
+            Err(format!("invalid iroh relay url(s): {}", bad.join(", ")))
+        }
+    }
+
+    /// The custom [`RelayMode`] for these settings, or `None` to keep the n0
+    /// default when no relays are set. Each relay has QUIC address discovery
+    /// **disabled** — a plaintext-HTTP relay can't offer it (QAD needs TLS),
+    /// and requesting it would only make clients probe a port that isn't
+    /// there; relay packet forwarding, the path that matters when peers can't
+    /// connect directly, is unaffected.
+    ///
+    /// Exposed so a caller holding its own [`Endpoint`] builder (e.g. the
+    /// tauri dial plugin) applies the same relays as [`serve`]/[`connect`]:
+    /// `if let Some(m) = cfg.relay_mode() { builder = builder.relay_mode(m); }`.
+    pub fn relay_mode(&self) -> Option<RelayMode> {
+        if self.relays.is_empty() {
+            return None;
+        }
+        let map = RelayMap::empty();
+        for url in &self.relays {
+            map.insert(url.clone(), Arc::new(RelayConfig::new(url.clone(), None)));
+        }
+        Some(RelayMode::Custom(map))
+    }
+}
+
 /// Bind an iroh endpoint for `alpn` with the given identity, then run the
 /// accept loop forever: for each accepted bi-stream, build a
 /// [`peerline::runtime::Peer`] over the shared text framing, hand it to
@@ -168,6 +234,7 @@ fn write_secret_key(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub async fn serve<T, F>(
     alpn: &[u8],
     secret_key: SecretKey,
+    config: IrohConfig,
     on_ticket: T,
     on_peer: F,
 ) -> Result<(), String>
@@ -175,7 +242,7 @@ where
     T: FnOnce(&str),
     F: Fn(&Peer) + Clone + Send + Sync + 'static,
 {
-    serve_mounted(secret_key, on_ticket, vec![(alpn.to_vec(), Arc::new(on_peer))]).await
+    serve_mounted(secret_key, config, on_ticket, vec![(alpn.to_vec(), Arc::new(on_peer))]).await
 }
 
 /// Bind ONE endpoint that accepts several ALPNs and run the accept loop
@@ -187,6 +254,7 @@ where
 /// can't collide.
 pub async fn serve_mounted<T>(
     secret_key: SecretKey,
+    config: IrohConfig,
     on_ticket: T,
     mounts: Vec<(Vec<u8>, PeerHandler)>,
 ) -> Result<(), String>
@@ -194,25 +262,46 @@ where
     T: FnOnce(&str),
 {
     let alpns: Vec<Vec<u8>> = mounts.iter().map(|(alpn, _)| alpn.clone()).collect();
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(alpns)
-        .secret_key(secret_key)
+    let mut builder = Endpoint::builder(presets::N0).alpns(alpns).secret_key(secret_key);
+    if let Some(relay_mode) = config.relay_mode() {
+        info!(relays = config.relays.len(), "peerline-iroh: using custom relay(s)");
+        builder = builder.relay_mode(relay_mode);
+    }
+    let endpoint = builder
         .bind()
         .await
         .map_err(|e| format!("iroh bind: {e}"))?;
 
-    // Wait (bounded) for a direct address before publishing the ticket:
-    // loopback/LAN addresses appear within moments of bind, and a ticket
-    // without them is undialable when no relay is reachable. Fall back to
-    // whatever the endpoint has (relay-only) after the cap so we never hang.
+    // Wait (bounded) for a RELAY address before publishing the ticket. A
+    // relay (`TransportAddr::Relay`) is the only path an off-LAN peer can
+    // bootstrap, and it appears only once the home-relay handshake
+    // completes — hundreds of ms to seconds after bind. `endpoint.addr()`
+    // mixes relay and direct (`TransportAddr::Ip`) entries, and the direct
+    // LAN/loopback ones are discovered near-instantly, so "addrs non-empty"
+    // would publish a silently LAN-only ticket before the relay exists.
+    // We also wait for a direct address once the relay is up (a same-LAN
+    // peer can then skip the relay), but only the relay is required.
+    //
+    // If no relay materializes within the cap the endpoint is not remotely
+    // reachable, so we FAIL rather than publish a degraded ticket — a
+    // peerline-iroh ticket that can't be dialed off-LAN is worse than an
+    // explicit error. `online()` resolves once a home relay connects.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), endpoint.online()).await;
     for _ in 0..60 {
-        if !endpoint.addr().addrs.is_empty() {
+        let addr = endpoint.addr();
+        let has_relay = addr.addrs.iter().any(|a| a.is_relay());
+        let has_direct = addr.addrs.iter().any(|a| a.is_ip());
+        if has_relay && has_direct {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    let ticket = encode_ticket(&endpoint.addr())?;
+    let addr = endpoint.addr();
+    if !addr.addrs.iter().any(|a| a.is_relay()) {
+        return Err("iroh: endpoint acquired no relay address — not remotely reachable".to_string());
+    }
+    let ticket = encode_ticket(&addr)?;
     info!(endpoint_id = %endpoint.id(), mounts = mounts.len(), "peerline-iroh endpoint listening");
     on_ticket(&ticket);
 
@@ -251,12 +340,23 @@ where
 /// For repeated dials, prefer holding a shared [`Endpoint`] and using it
 /// directly — this helper binds a new endpoint per call, which suits a
 /// one-shot client.
+///
+/// **Relay:** the dialer takes no relay config — it adopts the relay(s) the
+/// ticket carries. The peer's home relay (baked into the ticket by the
+/// acceptor's [`IrohConfig`]) is both where we reach the peer and where the
+/// peer reaches us back, so we bind our own endpoint to that same relay. A
+/// ticket with no relay ⇒ the n0 defaults.
 pub async fn connect(
     ticket: &str,
     alpn: &[u8],
 ) -> Result<(Peer, BoxFuture<'static, ()>), String> {
     let addr = decode_ticket(ticket)?;
-    let endpoint = Endpoint::builder(presets::N0)
+    let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
+    let mut builder = Endpoint::builder(presets::N0);
+    if let Some(relay_mode) = (IrohConfig { relays }).relay_mode() {
+        builder = builder.relay_mode(relay_mode);
+    }
+    let endpoint = builder
         .bind()
         .await
         .map_err(|e| format!("iroh bind: {e}"))?;

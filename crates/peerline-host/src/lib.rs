@@ -136,6 +136,7 @@ pub struct Host {
     services: Vec<(Arc<dyn Service>, Mount)>,
     ws_bind: Option<SocketAddr>,
     iroh_key: Option<Option<PathBuf>>,
+    iroh_relays: Vec<String>,
     report: ReportMode,
 }
 
@@ -166,6 +167,17 @@ impl Host {
     #[must_use]
     pub fn iroh_endpoint(mut self, key_path: Option<PathBuf>) -> Self {
         self.iroh_key = Some(key_path);
+        self
+    }
+
+    /// Add a custom iroh relay (repeatable). Both ends of a link must share
+    /// the same relay; a self-hosted relay is what makes the iroh transport
+    /// reachable where n0's public relays are distant or unreliable and direct
+    /// connectivity is impossible. No relays ⇒ n0's defaults. Only takes effect
+    /// with an [`Host::iroh_endpoint`]; the URL is validated at [`Host::run`].
+    #[must_use]
+    pub fn iroh_relay(mut self, url: impl Into<String>) -> Self {
+        self.iroh_relays.push(url.into());
         self
     }
 
@@ -294,7 +306,13 @@ impl Host {
                 } else {
                     None
                 };
-                serves.push(iroh_serve(key_path.clone(), mounts, dials, ticket_tx)?);
+                serves.push(iroh_serve(
+                    key_path.clone(),
+                    self.iroh_relays.clone(),
+                    mounts,
+                    dials,
+                    ticket_tx,
+                )?);
             }
         }
 
@@ -362,14 +380,18 @@ fn uds_serve(_: Vec<(PathBuf, PeerHandler)>) -> Result<Serve, String> {
 #[cfg(feature = "iroh")]
 fn iroh_serve(
     key_path: Option<PathBuf>,
+    relays: Vec<String>,
     mounts: Vec<(Vec<u8>, PeerHandler)>,
     dials: Vec<(String, String)>,
     ticket_tx: Option<oneshot::Sender<String>>,
 ) -> Result<Serve, String> {
     let key = peerline_transport_iroh::load_or_create_secret_key(key_path.as_deref())
         .map_err(|e| format!("peerline-host: iroh key: {e}"))?;
-    Ok(Box::pin(peerline_transport_iroh::serve_mounted(
+    let config = peerline_transport_iroh::IrohConfig::from_relay_urls(relays)
+        .map_err(|e| format!("peerline-host: iroh relay: {e}"))?;
+    let serve = peerline_transport_iroh::serve_mounted(
         key,
+        config,
         // The one ticket addresses the shared endpoint; each service is
         // reached by dialing it with that service's ALPN. Print both, and
         // hand the ticket to the manager report if one is waiting.
@@ -383,11 +405,26 @@ fn iroh_serve(
             }
         },
         mounts,
-    )))
+    );
+    // iroh is best-effort: an endpoint that never becomes remotely reachable
+    // (no relay) fails ONLY the iroh transport, not the whole host — the other
+    // transports keep serving. Log the failure, then park so this slot never
+    // resolves and completes `try_join_all` (which would tear the rest down).
+    // Dropping the serve future here also drops `ticket_tx`, so the manager
+    // report proceeds without an iroh ticket instead of blocking on it.
+    Ok(Box::pin(async move {
+        if let Err(e) = serve.await {
+            tracing::error!(error = %e, "peerline-host: iroh transport failed; \
+                                         continuing without it");
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }))
 }
 #[cfg(not(feature = "iroh"))]
 fn iroh_serve(
     _: Option<PathBuf>,
+    _: Vec<String>,
     _: Vec<(Vec<u8>, PeerHandler)>,
     _: Vec<(String, String)>,
     _: Option<oneshot::Sender<String>>,

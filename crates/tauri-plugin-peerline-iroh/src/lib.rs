@@ -25,7 +25,7 @@ use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use iroh::endpoint::presets;
 use iroh::Endpoint;
-use peerline_transport_iroh::{decode_ticket, text_frames};
+use peerline_transport_iroh::{decode_ticket, text_frames, IrohConfig, RelayUrl};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{command, AppHandle, Manager, Runtime};
@@ -61,7 +61,11 @@ struct Conn {
 /// chosen per `connect`, so one endpoint serves every service.
 #[derive(Default)]
 struct IrohState {
-    endpoint: AsyncMutex<Option<Endpoint>>,
+    /// The one shared dialing endpoint plus the relay set it was bound with.
+    /// The dialer's relay is whatever the dialed ticket carries, so a ticket
+    /// that introduces a new relay triggers a rebind (with the union) — the
+    /// dialer never needs separate relay config.
+    endpoint: AsyncMutex<Option<(Endpoint, Vec<RelayUrl>)>>,
     conns: Mutex<HashMap<u64, Conn>>,
     next_id: AtomicU64,
 }
@@ -75,19 +79,34 @@ impl IrohState {
         self.conns.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The one shared client endpoint, bound on first use. `Endpoint`
-    /// is cheap to clone (an `Arc` inside). No ALPNs are configured on a
-    /// dialing endpoint — each `connect` passes its own.
-    async fn endpoint(&self) -> Result<Endpoint, String> {
+    /// The one shared client endpoint, bound on first use with the relay(s)
+    /// the dialed ticket carries. `Endpoint` is cheap to clone (an `Arc`
+    /// inside). No ALPNs are configured on a dialing endpoint — each `connect`
+    /// passes its own. If a later ticket carries a relay the endpoint isn't
+    /// already bound with, it rebinds with the union so both peers' home
+    /// relays remain reachable; existing connections keep their own links.
+    async fn endpoint_for(&self, mut want: Vec<RelayUrl>) -> Result<Endpoint, String> {
         let mut guard = self.endpoint.lock().await;
-        if let Some(e) = guard.as_ref() {
-            return Ok(e.clone());
+        if let Some((e, bound)) = guard.as_ref() {
+            if want.iter().all(|r| bound.contains(r)) {
+                return Ok(e.clone());
+            }
+            // A new relay appeared — rebind with the union of old + new.
+            for r in bound {
+                if !want.contains(r) {
+                    want.push(r.clone());
+                }
+            }
         }
-        let e = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0);
+        if let Some(relay_mode) = (IrohConfig { relays: want.clone() }).relay_mode() {
+            builder = builder.relay_mode(relay_mode);
+        }
+        let e = builder
             .bind()
             .await
             .map_err(|e| format!("iroh bind: {e}"))?;
-        *guard = Some(e.clone());
+        *guard = Some((e.clone(), want));
         Ok(e)
     }
 }
@@ -101,7 +120,11 @@ async fn connect<R: Runtime>(
 ) -> Result<ConnectResult, String> {
     let state = app.state::<IrohState>();
     let addr = decode_ticket(&ticket)?;
-    let endpoint = state.endpoint().await?;
+    // The dialer's relay is the ticket's relay: the peer's home relay is both
+    // where we reach it and where it reaches us back, so we bind our endpoint
+    // to the same relay(s) — no separate dial-side relay config.
+    let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
+    let endpoint = state.endpoint_for(relays).await?;
     let conn = endpoint
         .connect(addr, alpn.as_bytes())
         .await
@@ -195,7 +218,9 @@ async fn pump<R: Runtime>(
 }
 
 /// Initialize the plugin. Register with the Tauri builder via
-/// `.plugin(tauri_plugin_peerline_iroh::init())`.
+/// `.plugin(tauri_plugin_peerline_iroh::init())`. No relay configuration is
+/// needed — the dialing endpoint adopts the relay carried by each ticket it
+/// dials (the acceptor bakes its relay into the ticket).
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("peerline-iroh")
         .invoke_handler(tauri::generate_handler![connect, send, close])

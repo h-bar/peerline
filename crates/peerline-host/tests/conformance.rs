@@ -337,6 +337,7 @@ impl Harness for Iroh {
                 let _ = peerline_transport_iroh::serve(
                     &a,
                     key,
+                    peerline_transport_iroh::IrohConfig::default(),
                     move |t| {
                         let _ = tx.send(t.to_string());
                     },
@@ -360,7 +361,9 @@ struct IrohEp {
 #[cfg(feature = "iroh")]
 impl Endpoint for IrohEp {
     fn connect(&self) -> BoxFuture<'_, Result<Connected, String>> {
-        Box::pin(dial_retry(move || peerline_transport_iroh::connect(&self.ticket, &self.alpn)))
+        Box::pin(dial_retry(move || {
+            peerline_transport_iroh::connect(&self.ticket, &self.alpn)
+        }))
     }
 }
 
