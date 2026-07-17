@@ -2389,6 +2389,8 @@ dependencies = [
  "iroh-base",
  "peerline",
  "postcard",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

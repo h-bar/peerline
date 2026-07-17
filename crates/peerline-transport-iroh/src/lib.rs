@@ -348,9 +348,114 @@ where
     Ok(())
 }
 
+// --- Dial modes -------------------------------------------------------------
+//
+// The path-pinning semantics live HERE, next to the ticket codec, so the two
+// dial sides (this crate's [`connect`] and the tauri plugin) cannot drift:
+// what "relay mode" means is defined once.
+
+/// Which path(s) a dial may use — the caller's explicit choice.
+///
+/// `Auto` dials the ticket's full address (direct preferred, relay as
+/// backup). `Relay` pins the dial through the ticket's relay(s) on an
+/// endpoint with **no IP transports at all**, so holepunching can never
+/// upgrade it off the relay. `Direct` pins the dial to the ticket's direct
+/// addresses with the relay disabled.
+///
+/// The pins exist because auto's mixed dial can anchor the QUIC handshake to
+/// a **one-way** direct path (a NAT/VPN asymmetry: the peer hears us, we
+/// never hear it) and time out even though the relay is healthy — pinning
+/// relay makes the dial deterministic from anywhere the relay is reachable.
+///
+/// Serde uses the lowercase wire strings (`"auto" | "relay" | "direct"`), so
+/// a JS-facing command can take the enum directly and a typo'd mode fails
+/// deserialization loudly instead of silently behaving like `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DialMode {
+    #[default]
+    Auto,
+    Relay,
+    Direct,
+}
+
+/// The peer address a dial in `mode` offers iroh: the full ticket address
+/// for `Auto`, only the relay(s) for `Relay`, only the direct addresses for
+/// `Direct`. Errors when the ticket cannot support the pin — better a loud
+/// refusal than a dial that can only time out.
+pub fn filtered_addr(addr: &EndpointAddr, mode: DialMode) -> Result<EndpointAddr, String> {
+    match mode {
+        DialMode::Auto => Ok(addr.clone()),
+        DialMode::Relay => {
+            let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
+            if relays.is_empty() {
+                return Err("relay mode: ticket carries no relay".into());
+            }
+            Ok(relays
+                .iter()
+                .fold(EndpointAddr::from(addr.id), |a, url| a.with_relay_url(url.clone())))
+        }
+        DialMode::Direct => {
+            let ips: Vec<_> = addr.ip_addrs().copied().collect();
+            if ips.is_empty() {
+                return Err("direct mode: ticket carries no direct addresses".into());
+            }
+            Ok(ips.iter().fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip)))
+        }
+    }
+}
+
+/// Bind the endpoint a dial in `mode` uses. `relays` is the ticket's relay
+/// set (ignored for `Direct`).
+///
+/// - `Auto`: an ephemeral `presets::N0` endpoint bound to the ticket's
+///   relays — suits one-shot dialers; an app holding a long-lived shared
+///   endpoint uses that for auto instead and never calls this arm.
+/// - `Relay`: a discovery-free `presets::Minimal` endpoint with **every IP
+///   transport removed** — no UDP sockets, so no path but the relay can
+///   ever exist on it.
+/// - `Direct`: a discovery-free `presets::Minimal` endpoint with the relay
+///   disabled.
+pub async fn dial_endpoint(relays: &[RelayUrl], mode: DialMode) -> Result<Endpoint, String> {
+    let bound = match mode {
+        DialMode::Auto => {
+            let mut builder = Endpoint::builder(presets::N0);
+            if let Some(relay_mode) = (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
+                builder = builder.relay_mode(relay_mode);
+            }
+            builder.bind().await
+        }
+        DialMode::Relay => {
+            let mut builder = Endpoint::builder(presets::Minimal).clear_ip_transports();
+            if let Some(relay_mode) = (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
+                builder = builder.relay_mode(relay_mode);
+            }
+            builder.bind().await
+        }
+        DialMode::Direct => {
+            Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+        }
+    };
+    bound.map_err(|e| format!("iroh bind ({mode:?}): {e}"))
+}
+
+/// One-stop dial preparation: the `(endpoint, filtered peer address)` pair
+/// for dialing `addr` in `mode` — [`dial_endpoint`] + [`filtered_addr`],
+/// with the relay set taken from the address itself.
+pub async fn dial_plan(addr: &EndpointAddr, mode: DialMode) -> Result<(Endpoint, EndpointAddr), String> {
+    let peer = filtered_addr(addr, mode)?;
+    let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
+    let endpoint = dial_endpoint(&relays, mode).await?;
+    Ok((endpoint, peer))
+}
+
 /// Dial the peerline endpoint named by `ticket` for `alpn` (the dial side
-/// of [`serve`]) and return one `(Peer, driver)`. Binds a fresh ephemeral
-/// dialing endpoint, connects, opens ONE bi-stream over the shared text
+/// of [`serve`]) and return one `(Peer, driver)`. Binds a fresh dialing
+/// endpoint shaped by `mode` (see [`DialMode`]), connects over the filtered
+/// peer address, opens ONE bi-stream over the shared text
 /// framing, and hands back a peer for the caller to configure. Drive
 /// `driver` to run the session; it resolves when the stream closes.
 ///
@@ -370,19 +475,12 @@ where
 pub async fn connect(
     ticket: &str,
     alpn: &[u8],
+    mode: DialMode,
 ) -> Result<(Peer, BoxFuture<'static, ()>), String> {
     let addr = decode_ticket(ticket)?;
-    let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
-    let mut builder = Endpoint::builder(presets::N0);
-    if let Some(relay_mode) = (IrohConfig { relays, ..Default::default() }).relay_mode() {
-        builder = builder.relay_mode(relay_mode);
-    }
-    let endpoint = builder
-        .bind()
-        .await
-        .map_err(|e| format!("iroh bind: {e}"))?;
+    let (endpoint, peer_addr) = dial_plan(&addr, mode).await?;
     let conn = endpoint
-        .connect(addr, alpn)
+        .connect(peer_addr, alpn)
         .await
         .map_err(|e| format!("iroh connect: {e}"))?;
     // `accept_bi` on the far side only resolves once we send data;
@@ -451,6 +549,42 @@ mod tests {
         assert!(decode_ticket("peerline1!!!notbase32!!!").is_err());
     }
 
+    #[test]
+    fn dial_mode_wire_strings_round_trip_and_typos_fail() {
+        for (wire, mode) in [("auto", DialMode::Auto), ("relay", DialMode::Relay), ("direct", DialMode::Direct)] {
+            let parsed: DialMode = serde_json::from_str(&format!("\"{wire}\"")).expect(wire);
+            assert_eq!(parsed, mode);
+            assert_eq!(serde_json::to_string(&mode).expect(wire), format!("\"{wire}\""));
+        }
+        // A typo'd mode must fail loudly, never silently behave like Auto.
+        assert!(serde_json::from_str::<DialMode>("\"relayy\"").is_err());
+    }
+
+    #[test]
+    fn filtered_addr_pins_and_validates() {
+        let id = SecretKey::generate().public();
+        let relay: RelayUrl = "http://relay.example:3340".parse().expect("relay url");
+        let ip: std::net::SocketAddr = "192.168.1.10:6466".parse().expect("ip");
+        let full = EndpointAddr::from(id).with_relay_url(relay.clone()).with_ip_addr(ip);
+
+        // Auto keeps everything.
+        let auto = filtered_addr(&full, DialMode::Auto).expect("auto");
+        assert_eq!(auto, full);
+        // Relay drops the direct addrs; Direct drops the relay.
+        let pinned_relay = filtered_addr(&full, DialMode::Relay).expect("relay");
+        assert_eq!(pinned_relay.relay_urls().count(), 1);
+        assert_eq!(pinned_relay.ip_addrs().count(), 0);
+        let pinned_direct = filtered_addr(&full, DialMode::Direct).expect("direct");
+        assert_eq!(pinned_direct.relay_urls().count(), 0);
+        assert_eq!(pinned_direct.ip_addrs().count(), 1);
+
+        // A ticket that can't support the pin refuses loudly.
+        let relay_only = EndpointAddr::from(id).with_relay_url(relay);
+        assert!(filtered_addr(&relay_only, DialMode::Direct).is_err());
+        let direct_only = EndpointAddr::from(id).with_ip_addr(ip);
+        assert!(filtered_addr(&direct_only, DialMode::Relay).is_err());
+    }
+
     // `connect` decodes the ticket before touching the network, so a
     // foreign ticket fails fast without binding an endpoint — the
     // dial-side counterpart to `foreign_prefix_is_rejected`.
@@ -458,7 +592,7 @@ mod tests {
     async fn connect_rejects_foreign_ticket() {
         // `Ok` carries a boxed driver (not `Debug`), so match rather than
         // `unwrap_err`.
-        let err = match connect("ws://127.0.0.1:6465", b"peerline/test/1").await {
+        let err = match connect("ws://127.0.0.1:6465", b"peerline/test/1", DialMode::Auto).await {
             Ok(_) => panic!("foreign ticket should not connect"),
             Err(e) => e,
         };

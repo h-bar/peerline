@@ -362,7 +362,7 @@ struct IrohEp {
 impl Endpoint for IrohEp {
     fn connect(&self) -> BoxFuture<'_, Result<Connected, String>> {
         Box::pin(dial_retry(move || {
-            peerline_transport_iroh::connect(&self.ticket, &self.alpn)
+            peerline_transport_iroh::connect(&self.ticket, &self.alpn, peerline_transport_iroh::DialMode::Auto)
         }))
     }
 }

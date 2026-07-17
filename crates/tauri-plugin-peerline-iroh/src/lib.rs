@@ -26,7 +26,7 @@ use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMode};
-use peerline_transport_iroh::{decode_ticket, text_frames, EndpointAddr, IrohConfig, RelayUrl};
+use peerline_transport_iroh::{decode_ticket, dial_plan, text_frames, DialMode, EndpointAddr, IrohConfig, RelayUrl};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{command, AppHandle, Manager, Runtime};
@@ -241,40 +241,19 @@ impl IrohState {
     }
 }
 
-/// Bind a dedicated, **discovery-free** endpoint (`presets::Minimal`) for a
-/// forced connect mode, so the peer address alone decides the path — discovery
-/// can't re-add other candidates. `relay_enabled` gives it the relay(s) and
-/// **strips every IP transport**: with no UDP sockets, holepunching has
-/// nothing to open a direct path with, so a relay-pinned connection can never
-/// silently upgrade off the relay (how iroh runs in browsers). Otherwise the
-/// relay is disabled (a direct-only endpoint keeps its IP transports).
-async fn dedicated_endpoint(relays: &[RelayUrl], relay_enabled: bool) -> Result<Endpoint, String> {
-    let mut builder = Endpoint::builder(presets::Minimal);
-    builder = if relay_enabled {
-        builder = builder.clear_ip_transports();
-        match (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
-            Some(rm) => builder.relay_mode(rm),
-            None => builder,
-        }
-    } else {
-        builder.relay_mode(RelayMode::Disabled)
-    };
-    let e = builder.bind().await.map_err(|e| format!("iroh bind (forced mode): {e}"))?;
-    info!(endpoint_id = %e.id(), relay_enabled, "peerline-iroh: bound dedicated endpoint for forced mode");
-    Ok(e)
-}
-
 #[command]
 async fn connect<R: Runtime>(
     app: AppHandle<R>,
     ticket: String,
     alpn: String,
     on_frame: Channel<Inbound>,
-    // Path mode: `"auto"` (default) uses the shared endpoint and lets iroh pick
-    // (prefers direct, relay as backup); `"relay"` forces the relay only;
-    // `"direct"` forces a direct path only. `relay`/`direct` bind a dedicated,
-    // discovery-free endpoint so the ticket's addresses alone decide the path.
-    mode: Option<String>,
+    // Path mode — deserialized straight into the shared [`DialMode`]
+    // (`"auto" | "relay" | "direct"` on the wire; anything else fails serde,
+    // loudly). `auto` (default) uses the shared endpoint and lets iroh pick;
+    // the pins dial a dedicated endpoint + filtered address via the shared
+    // crate's `dial_plan`, so the semantics can't drift from the native dial
+    // side.
+    mode: Option<DialMode>,
 ) -> Result<ConnectResult, String> {
     let state = app.state::<IrohState>();
     let t0 = Instant::now();
@@ -284,47 +263,28 @@ async fn connect<R: Runtime>(
     // to the same relay(s) — no separate dial-side relay config.
     let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
     let directs: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
-    let mode = mode.as_deref().unwrap_or("auto");
+    let mode = mode.unwrap_or_default();
     info!(
-        endpoint_id = %addr.id, %alpn, %mode,
+        endpoint_id = %addr.id, %alpn, mode = ?mode,
         relays = ?relays.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         directs = ?directs,
         "peerline-iroh connect: dialing"
     );
 
-    // Pick the endpoint + the peer address to dial per mode. A forced mode uses
-    // a dedicated no-discovery endpoint + a filtered address, so the path can't
-    // silently fall back (or get re-widened by discovery).
+    // Pick the endpoint + the peer address to dial per mode. A pinned mode
+    // rides the shared crate's `dial_plan` — dedicated no-discovery endpoint
+    // + filtered address, so the path can't silently fall back (or get
+    // re-widened by discovery). Auto keeps this plugin's long-lived shared
+    // endpoint rather than dial_plan's one-shot auto endpoint.
     let (endpoint, peer_addr, dedicated): (Endpoint, EndpointAddr, Option<Endpoint>) = match mode {
-        "relay" => {
-            if relays.is_empty() {
-                return Err("relay mode: ticket carries no relay".into());
-            }
-            let ep = dedicated_endpoint(&relays, true).await?;
-            let a = relays
-                .iter()
-                .fold(EndpointAddr::from(addr.id), |a, u| a.with_relay_url(u.clone()));
-            (ep.clone(), a, Some(ep))
-        }
-        "direct" => {
-            let ips: Vec<_> = addr.ip_addrs().copied().collect();
-            if ips.is_empty() {
-                return Err("direct mode: ticket carries no direct addresses".into());
-            }
-            let ep = dedicated_endpoint(&relays, false).await?;
-            let a = ips
-                .iter()
-                .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip));
-            (ep.clone(), a, Some(ep))
-        }
-        "auto" => {
+        DialMode::Auto => {
             let ep = state.endpoint_for(relays).await?;
             (ep, addr, None)
         }
-        other => {
-            // A typo'd mode silently behaving like `auto` would defeat the
-            // caller's explicit path choice — fail loudly instead.
-            return Err(format!("unknown connect mode `{other}` (expected auto | relay | direct)"));
+        DialMode::Relay | DialMode::Direct => {
+            let (ep, peer) = dial_plan(&addr, mode).await?;
+            info!(endpoint_id = %ep.id(), ?mode, "peerline-iroh: bound dedicated endpoint for pinned mode");
+            (ep.clone(), peer, Some(ep))
         }
     };
 
@@ -332,7 +292,7 @@ async fn connect<R: Runtime>(
         .connect(peer_addr, alpn.as_bytes())
         .await
         .map_err(|e| {
-            warn!(error = %e, %mode, elapsed_ms = t0.elapsed().as_millis() as u64,
+            warn!(error = %e, ?mode, elapsed_ms = t0.elapsed().as_millis() as u64,
                   "peerline-iroh connect: iroh connect FAILED");
             format!("iroh connect: {e}")
         })?;
@@ -375,7 +335,7 @@ async fn connect<R: Runtime>(
         Conn { tx, abort: handle.abort_handle(), conn: conn_for_status, endpoint: dedicated },
     );
     drop(conns);
-    info!(%id, %mode, elapsed_ms = t0.elapsed().as_millis() as u64,
+    info!(%id, ?mode, elapsed_ms = t0.elapsed().as_millis() as u64,
           "peerline-iroh connect: READY (bi-stream open, pump running) — awaiting first frame from app");
     Ok(ConnectResult { id })
 }
