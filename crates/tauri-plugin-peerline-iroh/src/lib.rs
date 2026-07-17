@@ -171,9 +171,10 @@ struct Conn {
     /// link while the pump still holds its own.
     conn: iroh::endpoint::Connection,
     /// For a forced `relay`/`direct` connection: the dedicated endpoint it was
-    /// dialed on (kept alive for the connection's lifetime). `None` for `auto`,
-    /// which uses the shared endpoint held in [`IrohState::endpoint`].
-    _endpoint: Option<Endpoint>,
+    /// dialed on (kept alive for the connection's lifetime, closed gracefully
+    /// when the connection ends). `None` for `auto`, which uses the shared
+    /// endpoint held in [`IrohState::endpoint`].
+    endpoint: Option<Endpoint>,
 }
 
 /// Plugin state: one shared dialing endpoint (built lazily) plus the
@@ -316,9 +317,14 @@ async fn connect<R: Runtime>(
                 .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip));
             (ep.clone(), a, Some(ep))
         }
-        _ => {
+        "auto" => {
             let ep = state.endpoint_for(relays).await?;
             (ep, addr, None)
+        }
+        other => {
+            // A typo'd mode silently behaving like `auto` would defeat the
+            // caller's explicit path choice — fail loudly instead.
+            return Err(format!("unknown connect mode `{other}` (expected auto | relay | direct)"));
         }
     };
 
@@ -366,7 +372,7 @@ async fn connect<R: Runtime>(
     let handle = tokio::spawn(pump(app.clone(), id, conn, send, recv, on_frame, rx));
     conns.insert(
         id,
-        Conn { tx, abort: handle.abort_handle(), conn: conn_for_status, _endpoint: dedicated },
+        Conn { tx, abort: handle.abort_handle(), conn: conn_for_status, endpoint: dedicated },
     );
     drop(conns);
     info!(%id, %mode, elapsed_ms = t0.elapsed().as_millis() as u64,
@@ -401,6 +407,11 @@ fn close<R: Runtime>(app: AppHandle<R>, id: u64) {
         Some(conn) => {
             info!(%id, "peerline-iroh close: command received — aborting connection");
             conn.abort.abort();
+            // A forced-mode connection owns its endpoint: close it gracefully
+            // (relay teardown, pending frames) instead of dropping it cold.
+            if let Some(endpoint) = conn.endpoint {
+                tauri::async_runtime::spawn(async move { endpoint.close().await });
+            }
         }
         None => debug!(%id, "peerline-iroh close: already gone"),
     }
@@ -661,7 +672,12 @@ async fn pump<R: Runtime>(
     // Only emits while bytes moved since the last tick — an idle wire is
     // silent.
     let stats = async {
-        let mut last_bytes = 0u64;
+        // Baseline at ticker start: the handshake already moved bytes, and a
+        // wire idle ever since should stay silent.
+        let mut last_bytes = {
+            let s = _conn.stats();
+            s.udp_tx.bytes + s.udp_rx.bytes
+        };
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let s = _conn.stats();
@@ -691,8 +707,13 @@ async fn pump<R: Runtime>(
     // Best-effort terminal signal; JS collapses it to a single onClose.
     let _ = channel.send(Inbound::Close);
     // Reclaim the table entry (no-op if `close` already removed it). If this
-    // task was aborted by `close`, `close` did the removal instead.
-    app.state::<IrohState>().conns().remove(&id);
+    // task was aborted by `close`, `close` did the removal instead. A
+    // forced-mode connection's dedicated endpoint gets a graceful close.
+    if let Some(conn) = app.state::<IrohState>().conns().remove(&id) {
+        if let Some(endpoint) = conn.endpoint {
+            tauri::async_runtime::spawn(async move { endpoint.close().await });
+        }
+    }
 }
 
 /// Initialize the plugin. Register with the Tauri builder via
