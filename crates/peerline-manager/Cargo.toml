@@ -1,7 +1,7 @@
 [package]
 name = "peerline-manager"
 description = "A live registry of the peerline services running on a host — itself a peerline service. Hosts register their dial coordinates over peerline and heartbeat to stay live (TTL-expired otherwise); clients query `manager.list` / `manager.lookup`. Reachable over any transport the host mounts it on. Ships a web dashboard and a `peerline-mon` CLI."
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 license = "MIT"
 

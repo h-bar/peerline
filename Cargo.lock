@@ -2329,7 +2329,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peerline"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "futures",
  "serde",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-host"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "futures",
  "peerline",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-manager"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "axum",
  "futures",
@@ -2373,14 +2373,14 @@ dependencies = [
 
 [[package]]
 name = "peerline-manager-protocol"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "peerline-transport-iroh"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-uds"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "futures",
  "peerline",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-ws"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "axum",
  "futures",

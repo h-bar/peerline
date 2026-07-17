@@ -1,7 +1,7 @@
 [package]
 name = "peerline-transport-iroh"
 description = "Iroh P2P (QUIC) transport for peerline — ticket codec, text framing, and a reusable accept-loop (`serve`) that drives a peerline `Peer` per bi-stream. Pairs with the tauri-plugin-peerline-iroh dial side; the ALPN is caller-supplied so one host can run several peerline services."
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 license = "MIT"
 

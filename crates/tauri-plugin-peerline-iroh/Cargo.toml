@@ -5,7 +5,7 @@
 
 [package]
 name = "tauri-plugin-peerline-iroh"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Tauri plugin: the dial side of a peerline-over-Iroh P2P transport. Pairs with any service's iroh acceptor; shares the wire contract via the peerline-iroh crate. Service-neutral — the ALPN is supplied per connect."
