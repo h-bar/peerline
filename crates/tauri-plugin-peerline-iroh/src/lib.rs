@@ -32,6 +32,13 @@ use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{command, AppHandle, Manager, Runtime};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
+
+/// First ~100 chars of a frame for a log preview (char-safe, no panic on a
+/// multi-byte boundary). Frames are JSON-RPC text.
+fn preview(s: &str) -> String {
+    s.chars().take(100).collect()
+}
 
 /// One inbound message delivered to JS over the connection's channel:
 /// a decoded text frame, or the single terminal `close` (graceful
@@ -163,6 +170,10 @@ struct Conn {
     /// `Arc` inside) and dropping this clone with the entry doesn't close the
     /// link while the pump still holds its own.
     conn: iroh::endpoint::Connection,
+    /// For a forced `relay`/`direct` connection: the dedicated endpoint it was
+    /// dialed on (kept alive for the connection's lifetime). `None` for `auto`,
+    /// which uses the shared endpoint held in [`IrohState::endpoint`].
+    _endpoint: Option<Endpoint>,
 }
 
 /// Plugin state: one shared dialing endpoint (built lazily) plus the
@@ -198,15 +209,20 @@ impl IrohState {
         let mut guard = self.endpoint.lock().await;
         if let Some((e, bound)) = guard.as_ref() {
             if want.iter().all(|r| bound.contains(r)) {
+                debug!(endpoint_id = %e.id(), "peerline-iroh endpoint: reusing bound endpoint");
                 return Ok(e.clone());
             }
             // A new relay appeared — rebind with the union of old + new.
+            warn!(bound = ?bound.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                  want = ?want.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                  "peerline-iroh endpoint: REBINDING (new relay) — this drops the shared endpoint");
             for r in bound {
                 if !want.contains(r) {
                     want.push(r.clone());
                 }
             }
         }
+        let relay_list: Vec<String> = want.iter().map(|r| r.to_string()).collect();
         let mut builder = Endpoint::builder(presets::N0);
         if let Some(relay_mode) = (IrohConfig { relays: want.clone(), ..Default::default() }).relay_mode() {
             builder = builder.relay_mode(relay_mode);
@@ -214,10 +230,37 @@ impl IrohState {
         let e = builder
             .bind()
             .await
-            .map_err(|e| format!("iroh bind: {e}"))?;
+            .map_err(|e| {
+                warn!(error = %e, "peerline-iroh endpoint: bind failed");
+                format!("iroh bind: {e}")
+            })?;
+        info!(endpoint_id = %e.id(), relays = ?relay_list, "peerline-iroh endpoint: bound");
         *guard = Some((e.clone(), want));
         Ok(e)
     }
+}
+
+/// Bind a dedicated, **discovery-free** endpoint (`presets::Minimal`) for a
+/// forced connect mode, so the peer address alone decides the path — discovery
+/// can't re-add other candidates. `relay_enabled` gives it the relay(s) and
+/// **strips every IP transport**: with no UDP sockets, holepunching has
+/// nothing to open a direct path with, so a relay-pinned connection can never
+/// silently upgrade off the relay (how iroh runs in browsers). Otherwise the
+/// relay is disabled (a direct-only endpoint keeps its IP transports).
+async fn dedicated_endpoint(relays: &[RelayUrl], relay_enabled: bool) -> Result<Endpoint, String> {
+    let mut builder = Endpoint::builder(presets::Minimal);
+    builder = if relay_enabled {
+        builder = builder.clear_ip_transports();
+        match (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
+            Some(rm) => builder.relay_mode(rm),
+            None => builder,
+        }
+    } else {
+        builder.relay_mode(RelayMode::Disabled)
+    };
+    let e = builder.bind().await.map_err(|e| format!("iroh bind (forced mode): {e}"))?;
+    info!(endpoint_id = %e.id(), relay_enabled, "peerline-iroh: bound dedicated endpoint for forced mode");
+    Ok(e)
 }
 
 #[command]
@@ -226,22 +269,87 @@ async fn connect<R: Runtime>(
     ticket: String,
     alpn: String,
     on_frame: Channel<Inbound>,
+    // Path mode: `"auto"` (default) uses the shared endpoint and lets iroh pick
+    // (prefers direct, relay as backup); `"relay"` forces the relay only;
+    // `"direct"` forces a direct path only. `relay`/`direct` bind a dedicated,
+    // discovery-free endpoint so the ticket's addresses alone decide the path.
+    mode: Option<String>,
 ) -> Result<ConnectResult, String> {
     let state = app.state::<IrohState>();
+    let t0 = Instant::now();
     let addr = decode_ticket(&ticket)?;
     // The dialer's relay is the ticket's relay: the peer's home relay is both
     // where we reach it and where it reaches us back, so we bind our endpoint
     // to the same relay(s) — no separate dial-side relay config.
     let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
-    let endpoint = state.endpoint_for(relays).await?;
+    let directs: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
+    let mode = mode.as_deref().unwrap_or("auto");
+    info!(
+        endpoint_id = %addr.id, %alpn, %mode,
+        relays = ?relays.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        directs = ?directs,
+        "peerline-iroh connect: dialing"
+    );
+
+    // Pick the endpoint + the peer address to dial per mode. A forced mode uses
+    // a dedicated no-discovery endpoint + a filtered address, so the path can't
+    // silently fall back (or get re-widened by discovery).
+    let (endpoint, peer_addr, dedicated): (Endpoint, EndpointAddr, Option<Endpoint>) = match mode {
+        "relay" => {
+            if relays.is_empty() {
+                return Err("relay mode: ticket carries no relay".into());
+            }
+            let ep = dedicated_endpoint(&relays, true).await?;
+            let a = relays
+                .iter()
+                .fold(EndpointAddr::from(addr.id), |a, u| a.with_relay_url(u.clone()));
+            (ep.clone(), a, Some(ep))
+        }
+        "direct" => {
+            let ips: Vec<_> = addr.ip_addrs().copied().collect();
+            if ips.is_empty() {
+                return Err("direct mode: ticket carries no direct addresses".into());
+            }
+            let ep = dedicated_endpoint(&relays, false).await?;
+            let a = ips
+                .iter()
+                .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip));
+            (ep.clone(), a, Some(ep))
+        }
+        _ => {
+            let ep = state.endpoint_for(relays).await?;
+            (ep, addr, None)
+        }
+    };
+
     let conn = endpoint
-        .connect(addr, alpn.as_bytes())
+        .connect(peer_addr, alpn.as_bytes())
         .await
-        .map_err(|e| format!("iroh connect: {e}"))?;
+        .map_err(|e| {
+            warn!(error = %e, %mode, elapsed_ms = t0.elapsed().as_millis() as u64,
+                  "peerline-iroh connect: iroh connect FAILED");
+            format!("iroh connect: {e}")
+        })?;
+    let n_relay = conn.paths().iter().filter(|p| p.is_relay()).count();
+    let n_direct = conn.paths().iter().filter(|p| p.is_ip()).count();
+    let selected = conn
+        .paths()
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| if p.is_relay() { "relay" } else { "direct" })
+        .unwrap_or("none");
+    info!(
+        remote = %conn.remote_id(), elapsed_ms = t0.elapsed().as_millis() as u64,
+        relay_paths = n_relay, direct_paths = n_direct, selected_path = selected,
+        "peerline-iroh connect: QUIC connection established"
+    );
     // Open the single peer-link bi-stream. The acceptor's `accept_bi`
     // only resolves once we send data — peerline's first client frame
     // does that, so no priming write is needed here.
-    let (send, recv) = conn.open_bi().await.map_err(|e| format!("iroh open_bi: {e}"))?;
+    let (send, recv) = conn.open_bi().await.map_err(|e| {
+        warn!(error = %e, "peerline-iroh connect: open_bi FAILED");
+        format!("iroh open_bi: {e}")
+    })?;
 
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -256,25 +364,45 @@ async fn connect<R: Runtime>(
     let mut conns = state.conns();
     let conn_for_status = conn.clone();
     let handle = tokio::spawn(pump(app.clone(), id, conn, send, recv, on_frame, rx));
-    conns.insert(id, Conn { tx, abort: handle.abort_handle(), conn: conn_for_status });
+    conns.insert(
+        id,
+        Conn { tx, abort: handle.abort_handle(), conn: conn_for_status, _endpoint: dedicated },
+    );
     drop(conns);
+    info!(%id, %mode, elapsed_ms = t0.elapsed().as_millis() as u64,
+          "peerline-iroh connect: READY (bi-stream open, pump running) — awaiting first frame from app");
     Ok(ConnectResult { id })
 }
 
 #[command]
 fn send<R: Runtime>(app: AppHandle<R>, id: u64, frame: String) -> Result<(), String> {
     let state = app.state::<IrohState>();
+    let len = frame.len();
     let conns = state.conns();
-    let conn = conns.get(&id).ok_or("unknown iroh connection")?;
-    conn.tx
-        .send(frame)
-        .map_err(|_| "iroh connection is closed".to_string())
+    let Some(conn) = conns.get(&id) else {
+        warn!(%id, "peerline-iroh send: unknown connection (already closed?)");
+        return Err("unknown iroh connection".to_string());
+    };
+    match conn.tx.send(frame) {
+        Ok(()) => {
+            debug!(%id, len, "peerline-iroh send: frame enqueued (app -> wire)");
+            Ok(())
+        }
+        Err(_) => {
+            warn!(%id, len, "peerline-iroh send: connection is closed — frame dropped");
+            Err("iroh connection is closed".to_string())
+        }
+    }
 }
 
 #[command]
 fn close<R: Runtime>(app: AppHandle<R>, id: u64) {
-    if let Some(conn) = app.state::<IrohState>().conns().remove(&id) {
-        conn.abort.abort();
+    match app.state::<IrohState>().conns().remove(&id) {
+        Some(conn) => {
+            info!(%id, "peerline-iroh close: command received — aborting connection");
+            conn.abort.abort();
+        }
+        None => debug!(%id, "peerline-iroh close: already gone"),
     }
 }
 
@@ -469,32 +597,70 @@ async fn pump<R: Runtime>(
     channel: Channel<Inbound>,
     mut rx: mpsc::UnboundedReceiver<String>,
 ) {
+    info!(%id, "peerline-iroh pump: started (bi-stream framing live)");
     let (mut sink, mut stream) = text_frames(tokio::io::join(recv, send));
 
+    // inbound: wire (peer) -> JS channel (app)
     let reader = async {
+        let mut n = 0u64;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(frame) => {
+                    n += 1;
+                    if n == 1 {
+                        info!(%id, len = frame.len(), preview = %preview(&frame),
+                              "peerline-iroh pump: FIRST inbound frame (peer -> app)");
+                    } else {
+                        debug!(%id, seq = n, len = frame.len(), preview = %preview(&frame),
+                               "peerline-iroh pump: inbound frame (peer -> app)");
+                    }
                     if channel.send(Inbound::Frame { frame }).is_err() {
-                        break; // JS side dropped the channel
+                        warn!(%id, inbound_total = n,
+                              "peerline-iroh pump: reader END — JS Channel dropped (app tore down transport)");
+                        return ("reader", "js-channel-dropped", n);
                     }
                 }
-                Err(_) => break, // stream error ⇒ wire gone
+                Err(e) => {
+                    warn!(%id, inbound_total = n, error = %e,
+                          "peerline-iroh pump: reader END — wire recv error (connection lost)");
+                    return ("reader", "wire-recv-error", n);
+                }
             }
         }
-    };
-    let writer = async {
-        while let Some(frame) = rx.recv().await {
-            if sink.send(frame).await.is_err() {
-                break; // write error ⇒ wire gone
-            }
-        }
+        info!(%id, inbound_total = n,
+              "peerline-iroh pump: reader END — stream closed (peer closed the bi-stream / connection)");
+        ("reader", "stream-ended", n)
     };
 
-    tokio::select! {
-        _ = reader => {}
-        _ = writer => {}
-    }
+    // outbound: JS `send` (app) -> wire (peer)
+    let writer = async {
+        let mut n = 0u64;
+        while let Some(frame) = rx.recv().await {
+            n += 1;
+            if n == 1 {
+                info!(%id, len = frame.len(), preview = %preview(&frame),
+                      "peerline-iroh pump: FIRST outbound frame (app -> peer)");
+            } else {
+                debug!(%id, seq = n, len = frame.len(), preview = %preview(&frame),
+                       "peerline-iroh pump: outbound frame (app -> peer)");
+            }
+            if let Err(e) = sink.send(frame).await {
+                warn!(%id, outbound_total = n, error = %e,
+                      "peerline-iroh pump: writer END — wire send error (connection lost)");
+                return ("writer", "wire-send-error", n);
+            }
+        }
+        info!(%id, outbound_total = n,
+              "peerline-iroh pump: writer END — outbound channel closed (all `send` handles dropped)");
+        ("writer", "outbound-closed", n)
+    };
+
+    let (side, reason, count) = tokio::select! {
+        r = reader => r,
+        w = writer => w,
+    };
+    warn!(%id, ended_side = side, reason, frame_count = count,
+          "peerline-iroh pump: ENDED — closing connection, signalling app");
     // Best-effort terminal signal; JS collapses it to a single onClose.
     let _ = channel.send(Inbound::Close);
     // Reclaim the table entry (no-op if `close` already removed it). If this

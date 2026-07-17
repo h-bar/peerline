@@ -22,3 +22,9 @@ tracing = "0.1"
 # `Peer` (the accept loop drives one per bi-stream) + the canonical
 # frame-size ceiling ([`peerline::MAX_FRAME_LEN`]).
 peerline = { path = "../..", features = ["runtime"] }
+
+[dev-dependencies]
+# Only for examples/diagnostics (e.g. `offlan_repro`): a subscriber so
+# RUST_LOG surfaces iroh's internal path/relay tracing.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
