@@ -655,9 +655,36 @@ async fn pump<R: Runtime>(
         ("writer", "outbound-closed", n)
     };
 
+    // Wire health every 5s while frames flow, so a slow transfer explains
+    // itself in the log: per-path RTT / congestion window / loss counters
+    // distinguish "path is lossy → cwnd collapsed" from "clean but thin pipe".
+    // Only emits while bytes moved since the last tick — an idle wire is
+    // silent.
+    let stats = async {
+        let mut last_bytes = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let s = _conn.stats();
+            let total = s.udp_tx.bytes + s.udp_rx.bytes;
+            if total == last_bytes {
+                continue;
+            }
+            last_bytes = total;
+            for p in _conn.paths().iter().filter(|p| p.is_selected()) {
+                let ps = p.stats();
+                info!(%id, path = %p.remote_addr(), rtt_ms = ps.rtt.as_millis() as u64,
+                      cwnd = ps.cwnd, congestion_events = ps.congestion_events,
+                      tx_bytes = s.udp_tx.bytes, rx_bytes = s.udp_rx.bytes,
+                      lost_packets = s.lost_packets, lost_bytes = s.lost_bytes,
+                      "peerline-iroh pump: wire stats");
+            }
+        }
+    };
+
     let (side, reason, count) = tokio::select! {
         r = reader => r,
         w = writer => w,
+        _ = stats => unreachable!("stats ticker never returns"),
     };
     warn!(%id, ended_side = side, reason, frame_count = count,
           "peerline-iroh pump: ENDED — closing connection, signalling app");
