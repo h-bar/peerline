@@ -9,7 +9,8 @@
 //!
 //! It exposes three commands a JS transport wrapper drives:
 //!
-//! - `connect(ticket, alpn, on_frame)` → dials the peer for `alpn`, opens
+//! - `connect(ticket, alpn, on_frame, mode?)` → dials the peer for `alpn`
+//!   over the chosen [`DialMode`] path (auto | relay | direct), opens
 //!   ONE QUIC bi-stream, spawns a pump (inbound frames → `on_frame`
 //!   [`Channel`], outbound frames ← an mpsc), returns a numeric `id`.
 //!   Resolves only after the stream is open, so a dial failure rejects on

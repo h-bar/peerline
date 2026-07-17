@@ -426,6 +426,13 @@ pub async fn dial_endpoint(relays: &[RelayUrl], mode: DialMode) -> Result<Endpoi
             builder.bind().await
         }
         DialMode::Relay => {
+            // Minimal sets no relay transport of its own, so Relay with no
+            // relays (plus the cleared IP transports) would bind an endpoint
+            // with ZERO transports — "successfully" un-dialable. dial_plan's
+            // filtered_addr already refuses this; guard the public fn too.
+            if relays.is_empty() {
+                return Err("relay mode: no relay to dial through".into());
+            }
             let mut builder = Endpoint::builder(presets::Minimal).clear_ip_transports();
             if let Some(relay_mode) = (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
                 builder = builder.relay_mode(relay_mode);
@@ -470,8 +477,9 @@ pub async fn dial_plan(addr: &EndpointAddr, mode: DialMode) -> Result<(Endpoint,
 /// **Relay:** the dialer takes no relay config — it adopts the relay(s) the
 /// ticket carries. The peer's home relay (baked into the ticket by the
 /// acceptor's [`IrohConfig`]) is both where we reach the peer and where the
-/// peer reaches us back, so we bind our own endpoint to that same relay. A
-/// ticket with no relay ⇒ the n0 defaults.
+/// peer reaches us back, so we bind our own endpoint to that same relay. In
+/// `Auto`, a ticket with no relay falls back to the n0 defaults; the pinned
+/// modes instead refuse a ticket that can't support the pin.
 pub async fn connect(
     ticket: &str,
     alpn: &[u8],
