@@ -38,6 +38,39 @@
 //! The consumer gets gRPC-flavoured "drop the handle and the server
 //! stops producing" semantics for free.
 //!
+//! ### The caller declares what a call returns
+//!
+//! A request is a *call*, so its return shape is known at the call site
+//! the way a function's signature is:
+//! [`Peer::call`](crate::runtime::Peer::call) returns one value,
+//! [`Peer::call_stream`](crate::runtime::Peer::call_stream) returns a
+//! sequence. That declaration decides which registry above holds the id,
+//! and it is authoritative.
+//!
+//! The responder cannot see it. Whether it answers with one `resp` frame
+//! or a run of `stream` frames follows from which handler it registered
+//! for the op, and the wire carries no marker tying the two together — so
+//! it can answer in a shape the caller never declared. That happens when
+//! an op handled unarily is called with `call_stream` (or isn't handled
+//! at all, where the reply is `MethodNotFound`), and in the mirror case.
+//!
+//! Such a reply is a **contract violation**, exactly like a function
+//! returning the wrong type, and is reported as one: the call fails with
+//! the remote's own error when it sent one — so a mistyped op still
+//! surfaces as `MethodNotFound` — and otherwise with an error naming the
+//! shape it should have been called with. Nothing is coerced to fit; a
+//! successful unary reply is never presented as a one-item stream.
+//!
+//! A shared contract both peers compile against would make this rare, but
+//! not impossible: a cross-language or stale peer never compiled against
+//! it, and the dispatch loop is reading bytes off a socket either way. So
+//! the check stays regardless.
+//!
+//! Frames matching no waiting call at all — a duplicate reply, a response
+//! the remote could not correlate (`id: null`) — are discarded, but
+//! [`Peer::on_protocol_error`](crate::runtime::Peer::on_protocol_error)
+//! can observe them.
+//!
 //! ### Runtime-agnostic
 //!
 //! No tokio dep, no spawn primitive. The module uses
@@ -54,7 +87,7 @@ mod outbound;
 mod peer;
 mod stream;
 
-pub use error::Error;
+pub use error::{Error, ProtocolError};
 pub use peer::{Metrics, Peer};
 pub use stream::{StreamItem, StreamReceiver, StreamSender};
 

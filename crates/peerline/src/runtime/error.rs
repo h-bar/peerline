@@ -35,3 +35,37 @@ impl From<RpcError> for Error {
         Error::Rpc(e)
     }
 }
+
+/// A frame the dispatch loop could not parse or could not route to a
+/// waiting caller. None of these can be surfaced through a `call` /
+/// `call_stream` return value — by definition there is no caller to
+/// return them to — so without a [`Peer::on_protocol_error`] hook they
+/// are invisible.
+///
+/// [`Peer::on_protocol_error`]: super::Peer::on_protocol_error
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ProtocolError {
+    /// An inbound frame failed to parse. The peer has already replied
+    /// with an `id: null` error response; this reports the local view.
+    MalformedFrame {
+        /// The parser's message.
+        message: String,
+    },
+    /// A response arrived carrying `id: null` — the remote could not
+    /// recover the id of the request it is answering, so this peer
+    /// cannot match it to a pending call either. Whichever call it was
+    /// for stays pending until the connection ends.
+    UncorrelatedResponse {
+        /// The error the remote reported, when the response carried one.
+        error: Option<RpcError>,
+    },
+    /// A response or stream frame arrived for an id with no pending
+    /// call and no active stream — a duplicate reply, a frame that
+    /// raced a cancelled stream, or a remote using ids it never saw.
+    /// Discarded.
+    UnroutableFrame {
+        /// The id the frame carried.
+        id: crate::wire::Id,
+    },
+}

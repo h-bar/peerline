@@ -10,7 +10,7 @@
 //! whatever executor they prefer — tokio, async-std, smol,
 //! `wasm-bindgen-futures`, `futures::executor::block_on`, …
 
-use super::error::Error;
+use super::error::{Error, ProtocolError};
 use super::outbound::{Outbound, forward_outbound};
 use super::stream::{StreamReceiver, StreamSender};
 use crate::peer as p;
@@ -39,6 +39,8 @@ type NotificationHandler = Arc<dyn Fn(serde_json::Value) -> BoxFuture<'static, (
 type StreamHandler =
     Arc<dyn Fn(serde_json::Value, StreamSender) -> BoxFuture<'static, ()> + Send + Sync>;
 
+type ProtocolErrorHandler = Arc<dyn Fn(ProtocolError) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Shared inner state — owned by the Peer, also accessible from spawned tasks
 // ---------------------------------------------------------------------------
@@ -49,11 +51,17 @@ type StreamHandler =
 /// wrappers — so a Peer clone is just an `Arc::clone`.
 pub(crate) struct PeerInner {
     ids: RequestIdGen,
+    /// Outgoing [`Peer::call`]s awaiting their `resp` frame.
     pub(crate) pending: Mutex<HashMap<Id, oneshot::Sender<Result<RawJson, RpcError>>>>,
+    /// Outgoing [`Peer::call_stream`]s awaiting their `stream` frames.
     pub(crate) streams: Mutex<HashMap<Id, mpsc::UnboundedSender<StreamFrame>>>,
     request_handlers: Mutex<HashMap<String, RequestHandler>>,
     notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
     stream_handlers: Mutex<HashMap<String, StreamHandler>>,
+    /// Optional observer for frames the dispatch loop could not parse or
+    /// route (see [`Peer::on_protocol_error`]). `None` — the default —
+    /// discards them exactly as before.
+    protocol_error_handler: Mutex<Option<ProtocolErrorHandler>>,
     /// Fair outbound scheduler — control-priority queue plus per-stream
     /// round-robin queues (see [`super::outbound`]). Every outgoing
     /// frame routes through here; [`send_frame`] enqueues control
@@ -187,6 +195,7 @@ impl Peer {
             request_handlers: Mutex::new(HashMap::new()),
             notification_handlers: Mutex::new(HashMap::new()),
             stream_handlers: Mutex::new(HashMap::new()),
+            protocol_error_handler: Mutex::new(None),
             outbound,
             inflight_handlers: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -415,6 +424,22 @@ impl Peer {
             .unwrap()
             .insert(op.into(), h);
     }
+
+    /// Observe frames the dispatch loop could not parse or could not
+    /// route to a waiting caller — see [`ProtocolError`]. These have no
+    /// caller to be returned to, so by default they are discarded
+    /// silently; register a hook to log or count them.
+    ///
+    /// The closure runs **inline on the dispatch loop**, so it must be
+    /// cheap and must not block: do the formatting, hand the value to a
+    /// channel, or bump a counter. Registering replaces any previous
+    /// hook.
+    pub fn on_protocol_error<F>(&self, f: F)
+    where
+        F: Fn(ProtocolError) + Send + Sync + 'static,
+    {
+        *self.inner.protocol_error_handler.lock().unwrap() = Some(Arc::new(f));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +525,8 @@ fn teardown(inner: &Arc<PeerInner>) {
             data: None,
         }));
     }
+    // Dropping the senders ends each receiver's stream, which is how a
+    // `call_stream` consumer sees the connection go away.
     inner.streams.lock().unwrap().clear();
 }
 
@@ -511,17 +538,57 @@ fn on_inbound_text(
     let frame = match p::parse_frame(text) {
         Ok(f) => f,
         Err(parse_err_response) => {
+            report(
+                inner,
+                ProtocolError::MalformedFrame {
+                    message: parse_err_response
+                        .error()
+                        .map_or_else(String::new, |e| e.message.clone()),
+                },
+            );
             let _ = send_frame(inner, parse_err_response);
             return;
         }
     };
     match p::classify(frame) {
         InboundKind::Response { id, outcome } => {
-            if let Some(id) = id
-                && let Some(tx) = inner.pending.lock().unwrap().remove(&id)
-            {
+            let Some(id) = id else {
+                // `id: null` — the remote couldn't recover the id of the
+                // request it is answering, so neither can we. Nothing to
+                // resolve; surface it rather than drop it silently.
+                report(
+                    inner,
+                    ProtocolError::UncorrelatedResponse {
+                        error: outcome.err(),
+                    },
+                );
+                return;
+            };
+            if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
                 let _ = tx.send(outcome);
+                return;
             }
+            // Not a unary waiter — so this id was declared by
+            // `call_stream`, and the remote answered it as a unary
+            // request: its handler for the op is unary, or there is none
+            // and this is the `MethodNotFound` reply. Deliver the outcome
+            // as an error terminal so the receiver ends, rather than
+            // waiting for stream frames that will never come.
+            //
+            // `remove`, not `get`: a unary reply is final, so nothing can
+            // legitimately follow this id. Taking the sender out means it
+            // drops once the terminal is queued — the receiver drains
+            // that frame and then sees the channel end — and a duplicate
+            // reply falls through to `UnroutableFrame` instead of
+            // yielding a second `Err` past the terminal.
+            if let Some(tx) = inner.streams.lock().unwrap().remove(&id) {
+                let _ = tx.unbounded_send(p::stream_terminal_with_rpc_error(
+                    id,
+                    unary_reply_to_stream_error(outcome),
+                ));
+                return;
+            }
+            report(inner, ProtocolError::UnroutableFrame { id });
         }
         InboundKind::IncomingRequest(req) => {
             let inner = inner.clone();
@@ -557,11 +624,61 @@ fn on_inbound_text(
             }));
         }
         InboundKind::Stream(sf) => {
-            let tx_opt = inner.streams.lock().unwrap().get(sf.id()).cloned();
+            let id = *sf.id();
+            let tx_opt = inner.streams.lock().unwrap().get(&id).cloned();
             if let Some(tx) = tx_opt {
                 let _ = tx.unbounded_send(sf);
+                return;
             }
+            // The mirror case: this id was declared by `call`, but the
+            // remote handles the op as a stream. A unary waiter can only
+            // take one value, so fail it — forwarding the stream's own
+            // error when it is ending in one, since that says more than
+            // the shape complaint would. Later frames of the same stream
+            // find no waiter and report as unroutable.
+            if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
+                let _ = tx.send(Err(sf.error.unwrap_or_else(|| {
+                    violation("responder answered with a stream; use call_stream")
+                })));
+                return;
+            }
+            report(inner, ProtocolError::UnroutableFrame { id });
         }
+    }
+}
+
+/// Turn a unary reply that arrived for a `call_stream` id into the error
+/// its terminal frame carries. An error reply is forwarded verbatim —
+/// `MethodNotFound` is the actual cause and reads far better than a
+/// shape complaint. A *successful* unary reply means the op exists but
+/// is unary, which is a contract violation rather than a one-item
+/// stream: coercing it would present a shape the caller never declared
+/// and put a coercion into the cross-language contract that nothing on
+/// the wire describes.
+fn unary_reply_to_stream_error(outcome: Result<RawJson, RpcError>) -> RpcError {
+    outcome
+        .err()
+        .unwrap_or_else(|| violation("responder answered with a unary response; use call"))
+}
+
+/// The error a reply gets when its shape contradicts what the caller
+/// declared. `Internal` because the fault is in the peers' agreement
+/// about the op, not in the request the caller sent.
+fn violation(message: &str) -> RpcError {
+    RpcError {
+        code: ErrorType::Internal.into(),
+        message: message.to_owned(),
+        data: None,
+    }
+}
+
+/// Hand a [`ProtocolError`] to the peer's hook, if one is registered.
+/// The hook is cloned out from under the lock so a slow (or reentrant)
+/// observer can't hold the registry.
+fn report(inner: &Arc<PeerInner>, err: ProtocolError) {
+    let handler = inner.protocol_error_handler.lock().unwrap().clone();
+    if let Some(handler) = handler {
+        handler(err);
     }
 }
 
@@ -641,7 +758,8 @@ async fn process_notification(inner: Arc<PeerInner>, notif: Notification) {
 /// notifications, this peer's own requests, and cancel notifications —
 /// everything except stream item frames, which route through the
 /// per-stream queues via [`StreamSender`]. The scheduler's writer
-/// decrements the queue depth after the wire write.
+/// decrements the queue depth as it dequeues, just before the wire
+/// write.
 pub(crate) fn send_frame<F: Into<Frame>>(inner: &PeerInner, frame: F) -> Result<(), Error> {
     let text = serde_json::to_string(&frame.into())?;
     inner.outbound.enqueue_control(text)
