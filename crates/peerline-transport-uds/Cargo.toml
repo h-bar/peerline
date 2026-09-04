@@ -1,9 +1,12 @@
 [package]
 name = "peerline-transport-uds"
 description = "Unix-domain-socket transport for peerline — a reusable accept-loop (`serve`) that drives a peerline `Peer` per connection over newline-delimited JSON frames. For local tooling on one host."
-version = "0.0.6"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["rpc", "unix-socket", "ipc", "transport", "peerline"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 futures = "0.3"
@@ -11,7 +14,7 @@ tokio = { version = "1", features = ["fs", "net", "rt"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 # `Peer` (one per connection) + the canonical frame-size ceiling.
-peerline = { path = "../..", features = ["runtime"] }
+peerline = { workspace = true, features = ["runtime"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }

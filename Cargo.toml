@@ -1,43 +1,40 @@
-# This manifest is both the `peerline` package and the workspace root.
-# The transport crates (`peerline-transport-{iroh,ws,uds}`) are members;
-# `tauri-plugin-peerline-iroh` (the dial plugin) is EXCLUDED — it carries
-# its own `[workspace]` so `tauri` stays out of peerline's default build.
+# Virtual workspace root. Every crate lives under `crates/`; nothing is
+# published from here.
+#
+# `peerline` is the protocol: wire envelopes, the peer runtime and the pubsub
+# layer. The transport crates carry it over WebSocket / Unix sockets / iroh.
+# The conformance suite — the golden vectors, the shared battery and the
+# cross-language interop harness — lives in the sibling `peerline-conformance`
+# repository, which depends on this one.
+#
+# The TypeScript implementation of the same protocol is the sibling
+# `peerline-ts` repository; the suite above checks the two against each other.
+#
+# The service layer that builds on this — the `Service` trait, the
+# multi-transport `Host` and the `peerline-manager` registry — lives in the
+# sibling `peerline-host` repository.
 [workspace]
 members = [
-    "crates/peerline-transport-iroh",
+    "crates/peerline",
     "crates/peerline-transport-ws",
     "crates/peerline-transport-uds",
-    "crates/peerline-host",
-    "crates/peerline-manager-protocol",
-    "crates/peerline-manager",
+    "crates/peerline-transport-iroh",
 ]
-exclude = ["crates/tauri-plugin-peerline-iroh"]
 resolver = "2"
 
-[package]
-name = "peerline"
-description = "Peer-symmetric bidirectional RPC toolkit — typed request/response/notification/stream envelopes with a pubsub layer, version-tagged JSON wire format, plus an optional stateful Peer runtime"
+# Shared by every member, so a release bumps one line rather than five.
+[workspace.package]
 version = "0.0.6"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/h-bar/peerline"
 
-[features]
-default = []
-# Stateful Peer with call / notify / stream / handler registry,
-# built on `futures::channel`. Runtime-agnostic — works on tokio,
-# async-std, smol, and wasm. Opt in if you want the `runtime`
-# module; leave off for pure wire types only.
-runtime = ["dep:futures", "dep:thiserror"]
-
-[dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
-# futures::channel (mpsc/oneshot) + FuturesUnordered let us run
-# handlers concurrently without needing a runtime's spawn primitive.
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
-thiserror = { version = "2", optional = true }
-
-[dev-dependencies]
-# Drives the loopback driver in tests under the `runtime` feature.
-tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# Every internal dependency is declared here with both a path and a version:
+# the path is what a workspace build uses, the version is what `cargo package`
+# writes into the published manifest. A path dependency without a version
+# cannot be packaged at all.
+[workspace.dependencies]
+peerline = { path = "crates/peerline", version = "0.0.6" }
+peerline-transport-ws = { path = "crates/peerline-transport-ws", version = "0.0.6" }
+peerline-transport-uds = { path = "crates/peerline-transport-uds", version = "0.0.6" }
+peerline-transport-iroh = { path = "crates/peerline-transport-iroh", version = "0.0.6" }

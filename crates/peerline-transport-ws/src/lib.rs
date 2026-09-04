@@ -58,13 +58,18 @@ pub async fn serve_mounted(
     let mut app = Router::new();
     for (path, handler) in mounts {
         info!(addr = %addr, path, "peerline-ws mount");
-        app = app.route(&path, get(move |ws: WebSocketUpgrade| ws_upgrade(ws, handler.clone())));
+        app = app.route(
+            &path,
+            get(move |ws: WebSocketUpgrade| ws_upgrade(ws, handler.clone())),
+        );
     }
     let app = app.layer(CorsLayer::permissive());
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("ws bind: {e}"))?;
-    axum::serve(listener, app).await.map_err(|e| format!("ws serve: {e}"))
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| format!("ws serve: {e}"))
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, handler: PeerHandler) -> impl IntoResponse {

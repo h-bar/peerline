@@ -1,7 +1,0 @@
-# This plugin is its own standalone cargo workspace (see Cargo.toml), so
-# its build artifacts land here rather than in the peerline-root target.
-/target
-
-# A library crate consumed by an app's `src-tauri` as a path dependency —
-# the consuming workspace owns the resolved lockfile.
-/Cargo.lock

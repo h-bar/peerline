@@ -6,10 +6,10 @@
 
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets;
 use iroh::Endpoint;
+use iroh::endpoint::presets;
 use iroh_base::EndpointAddr;
-use peerline_transport_iroh::{decode_ticket, IrohConfig};
+use peerline_transport_iroh::{IrohConfig, decode_ticket};
 
 #[tokio::main]
 async fn main() {
@@ -21,8 +21,12 @@ async fn main() {
         .init();
 
     let mut args = std::env::args().skip(1);
-    let ticket = args.next().expect("usage: dial_ticket <ticket> <alpn> [full|relay|direct]");
-    let alpn = args.next().expect("usage: dial_ticket <ticket> <alpn> [full|relay|direct]");
+    let ticket = args
+        .next()
+        .expect("usage: dial_ticket <ticket> <alpn> [full|relay|direct]");
+    let alpn = args
+        .next()
+        .expect("usage: dial_ticket <ticket> <alpn> [full|relay|direct]");
     let shape = args.next().unwrap_or_else(|| "all".into());
 
     let addr = decode_ticket(&ticket).expect("decode ticket");
@@ -32,14 +36,17 @@ async fn main() {
     println!("  relays:  {relays:?}");
     println!("  directs: {directs:?}");
 
-    let relay_only = relays
-        .iter()
-        .fold(EndpointAddr::from(addr.id), |a, r| a.with_relay_url(r.clone()));
+    let relay_only = relays.iter().fold(EndpointAddr::from(addr.id), |a, r| {
+        a.with_relay_url(r.clone())
+    });
     let direct_only = directs
         .iter()
         .fold(EndpointAddr::from(addr.id), |a, i| a.with_ip_addr(*i));
 
-    let cfg = IrohConfig { relays: relays.clone(), ..Default::default() };
+    let cfg = IrohConfig {
+        relays: relays.clone(),
+        ..Default::default()
+    };
     if shape == "all" || shape == "full" {
         dial(&cfg, "full", addr.clone(), alpn.as_bytes()).await;
     }
@@ -59,7 +66,8 @@ async fn main() {
             .await
             .expect("relay bench connect");
         let (send, recv) = conn.open_bi().await.expect("open_bi");
-        let (mut sink, mut stream) = peerline_transport_iroh::text_frames(tokio::io::join(recv, send));
+        let (mut sink, mut stream) =
+            peerline_transport_iroh::text_frames(tokio::io::join(recv, send));
         use futures::{SinkExt, StreamExt};
         let t0 = std::time::Instant::now();
         sink.send(r#"{"ver":"1","kind":"req","id":1,"op":"list","args":{}}"#.to_string())
@@ -88,7 +96,12 @@ async fn main() {
         }
         let ep = builder.bind().await.expect("bind (no ip transports)");
         let t0 = std::time::Instant::now();
-        match tokio::time::timeout(Duration::from_secs(20), ep.connect(relay_only, alpn.as_bytes())).await {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            ep.connect(relay_only, alpn.as_bytes()),
+        )
+        .await
+        {
             Ok(Ok(conn)) => {
                 println!("== relay-strict: QUIC OK in {:?}", t0.elapsed());
                 // Give holepunching time to (fail to) upgrade, then inspect.
@@ -96,7 +109,13 @@ async fn main() {
                 let paths: Vec<String> = conn
                     .paths()
                     .iter()
-                    .map(|p| format!("{}{}", p.remote_addr(), if p.is_selected() { " [selected]" } else { "" }))
+                    .map(|p| {
+                        format!(
+                            "{}{}",
+                            p.remote_addr(),
+                            if p.is_selected() { " [selected]" } else { "" }
+                        )
+                    })
                     .collect();
                 println!("   paths after 5s: {paths:?}");
             }
@@ -106,7 +125,13 @@ async fn main() {
         ep.close().await;
     }
     if shape == "all" || shape == "direct" {
-        dial(&IrohConfig::default(), "direct-only", direct_only, alpn.as_bytes()).await;
+        dial(
+            &IrohConfig::default(),
+            "direct-only",
+            direct_only,
+            alpn.as_bytes(),
+        )
+        .await;
     }
     if shape == "all" || shape == "hostile" {
         // Off-LAN simulation: the ticket's direct addrs, on a foreign
@@ -118,9 +143,9 @@ async fn main() {
             "127.0.0.1:9".parse().unwrap(),
             "192.168.31.1:6466".parse().unwrap(), // this LAN's router, closed port
         ];
-        let mut hostile = relays
-            .iter()
-            .fold(EndpointAddr::from(addr.id), |a, r| a.with_relay_url(r.clone()));
+        let mut hostile = relays.iter().fold(EndpointAddr::from(addr.id), |a, r| {
+            a.with_relay_url(r.clone())
+        });
         for i in refusing {
             hostile = hostile.with_ip_addr(i);
         }

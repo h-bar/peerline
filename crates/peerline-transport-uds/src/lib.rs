@@ -49,7 +49,9 @@ where
 /// distinct socket file — the filesystem is the namespace. All listeners
 /// run concurrently; the call returns if any one fails to bind or accept.
 pub async fn serve_mounted(mounts: Vec<(PathBuf, PeerHandler)>) -> Result<(), String> {
-    let listeners = mounts.into_iter().map(|(path, handler)| serve_one(path, handler));
+    let listeners = mounts
+        .into_iter()
+        .map(|(path, handler)| serve_one(path, handler));
     futures::future::try_join_all(listeners).await.map(|_| ())
 }
 
@@ -123,7 +125,10 @@ fn peer_over(stream: UnixStream) -> (Peer, impl Future<Output = ()>) {
     // Pin the line ceiling to the shared [`peerline::MAX_FRAME_LEN`]
     // rather than `LinesCodec`'s unbounded default, so a single JSON-RPC
     // frame is capped at the same size as the other transports.
-    let framed = Framed::new(stream, LinesCodec::new_with_max_length(peerline::MAX_FRAME_LEN));
+    let framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(peerline::MAX_FRAME_LEN),
+    );
     let (sink, stream) = framed.split();
     Peer::new(Box::pin(sink), Box::pin(stream))
 }

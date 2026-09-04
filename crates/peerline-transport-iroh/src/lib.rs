@@ -1,8 +1,8 @@
 //! Iroh P2P (QUIC) transport for peerline.
 //!
 //! Both ends of the peer link depend on this crate so they cannot drift:
-//! an accepting service and the dial side (`tauri-plugin-peerline-iroh`).
-//! It owns:
+//! an accepting service and the native dial side (e.g. the iroh-pipe
+//! tunnel daemon). It owns:
 //!
 //! 1. [`encode_ticket`] / [`decode_ticket`] — [`TICKET_PREFIX`] + base32
 //!    of the postcard-encoded [`EndpointAddr`]. Both ends must pin the
@@ -15,14 +15,15 @@
 //!    closure. [`load_or_create_secret_key`] persists a stable identity.
 //! 4. [`connect`] — the native-Rust dial side: bind an ephemeral
 //!    endpoint, dial a ticket for a given ALPN, and return one
-//!    `(Peer, driver)`. (The `tauri-plugin-peerline-iroh` crate is the
-//!    JS-bridge dial side for Tauri apps; it shares the same framing.)
+//!    `(Peer, driver)`. (Tauri apps no longer dial per-service iroh
+//!    links directly — they reach services through the iroh-pipe
+//!    tunnel's loopback frontends.)
 //!
 //! The **ALPN is deliberately NOT owned here**: it names a *specific*
 //! service, and one host may run several peerline services behind a
 //! single endpoint (one ALPN each). So each service passes its own ALPN
-//! to [`serve`] (and the dial plugin passes it per `connect`), while the
-//! ticket codec and framing stay shared and generic.
+//! to [`serve`] (and dialers pass it per `connect`), while the ticket
+//! codec and framing stay shared and generic.
 
 #![forbid(unsafe_code)]
 
@@ -96,9 +97,8 @@ where
         .new_codec();
     let framed = Framed::new(io, codec);
     let (sink, stream) = framed.split();
-    let sink = sink.with(|text: String| async move {
-        Ok::<Bytes, io::Error>(Bytes::from(text.into_bytes()))
-    });
+    let sink = sink
+        .with(|text: String| async move { Ok::<Bytes, io::Error>(Bytes::from(text.into_bytes())) });
     // Fail loudly on a non-UTF-8 frame rather than silently substituting
     // replacement characters: JSON-RPC frames are always UTF-8, so a bad
     // frame means a corrupt wire, and surfacing it ends the stream.
@@ -123,7 +123,10 @@ pub fn load_or_create_secret_key(path: Option<&Path>) -> io::Result<SecretKey> {
     if path.exists() {
         let bytes = std::fs::read(path)?;
         let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "secret key file must be exactly 32 bytes")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secret key file must be exactly 32 bytes",
+            )
         })?;
         Ok(SecretKey::from_bytes(&arr))
     } else {
@@ -196,7 +199,10 @@ impl IrohConfig {
             }
         }
         if bad.is_empty() {
-            Ok(Self { relays, bind_port: None })
+            Ok(Self {
+                relays,
+                bind_port: None,
+            })
         } else {
             Err(format!("invalid iroh relay url(s): {}", bad.join(", ")))
         }
@@ -250,7 +256,13 @@ where
     T: FnOnce(&str),
     F: Fn(&Peer) + Clone + Send + Sync + 'static,
 {
-    serve_mounted(secret_key, config, on_ticket, vec![(alpn.to_vec(), Arc::new(on_peer))]).await
+    serve_mounted(
+        secret_key,
+        config,
+        on_ticket,
+        vec![(alpn.to_vec(), Arc::new(on_peer))],
+    )
+    .await
 }
 
 /// Bind ONE endpoint that accepts several ALPNs and run the accept loop
@@ -270,9 +282,14 @@ where
     T: FnOnce(&str),
 {
     let alpns: Vec<Vec<u8>> = mounts.iter().map(|(alpn, _)| alpn.clone()).collect();
-    let mut builder = Endpoint::builder(presets::N0).alpns(alpns).secret_key(secret_key);
+    let mut builder = Endpoint::builder(presets::N0)
+        .alpns(alpns)
+        .secret_key(secret_key);
     if let Some(relay_mode) = config.relay_mode() {
-        info!(relays = config.relays.len(), "peerline-iroh: using custom relay(s)");
+        info!(
+            relays = config.relays.len(),
+            "peerline-iroh: using custom relay(s)"
+        );
         builder = builder.relay_mode(relay_mode);
     }
     // Bind a fixed UDP port (all interfaces) if configured, so the ticket's
@@ -320,7 +337,9 @@ where
 
     let addr = endpoint.addr();
     if !addr.addrs.iter().any(|a| a.is_relay()) {
-        return Err("iroh: endpoint acquired no relay address — not remotely reachable".to_string());
+        return Err(
+            "iroh: endpoint acquired no relay address — not remotely reachable".to_string(),
+        );
     }
     let ticket = encode_ticket(&addr)?;
     info!(endpoint_id = %endpoint.id(), mounts = mounts.len(), "peerline-iroh endpoint listening");
@@ -391,16 +410,18 @@ pub fn filtered_addr(addr: &EndpointAddr, mode: DialMode) -> Result<EndpointAddr
             if relays.is_empty() {
                 return Err("relay mode: ticket carries no relay".into());
             }
-            Ok(relays
-                .iter()
-                .fold(EndpointAddr::from(addr.id), |a, url| a.with_relay_url(url.clone())))
+            Ok(relays.iter().fold(EndpointAddr::from(addr.id), |a, url| {
+                a.with_relay_url(url.clone())
+            }))
         }
         DialMode::Direct => {
             let ips: Vec<_> = addr.ip_addrs().copied().collect();
             if ips.is_empty() {
                 return Err("direct mode: ticket carries no direct addresses".into());
             }
-            Ok(ips.iter().fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip)))
+            Ok(ips
+                .iter()
+                .fold(EndpointAddr::from(addr.id), |a, ip| a.with_ip_addr(*ip)))
         }
     }
 }
@@ -420,7 +441,12 @@ pub async fn dial_endpoint(relays: &[RelayUrl], mode: DialMode) -> Result<Endpoi
     let bound = match mode {
         DialMode::Auto => {
             let mut builder = Endpoint::builder(presets::N0);
-            if let Some(relay_mode) = (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
+            if let Some(relay_mode) = (IrohConfig {
+                relays: relays.to_vec(),
+                ..Default::default()
+            })
+            .relay_mode()
+            {
                 builder = builder.relay_mode(relay_mode);
             }
             builder.bind().await
@@ -434,7 +460,12 @@ pub async fn dial_endpoint(relays: &[RelayUrl], mode: DialMode) -> Result<Endpoi
                 return Err("relay mode: no relay to dial through".into());
             }
             let mut builder = Endpoint::builder(presets::Minimal).clear_ip_transports();
-            if let Some(relay_mode) = (IrohConfig { relays: relays.to_vec(), ..Default::default() }).relay_mode() {
+            if let Some(relay_mode) = (IrohConfig {
+                relays: relays.to_vec(),
+                ..Default::default()
+            })
+            .relay_mode()
+            {
                 builder = builder.relay_mode(relay_mode);
             }
             builder.bind().await
@@ -452,7 +483,10 @@ pub async fn dial_endpoint(relays: &[RelayUrl], mode: DialMode) -> Result<Endpoi
 /// One-stop dial preparation: the `(endpoint, filtered peer address)` pair
 /// for dialing `addr` in `mode` — [`dial_endpoint`] + [`filtered_addr`],
 /// with the relay set taken from the address itself.
-pub async fn dial_plan(addr: &EndpointAddr, mode: DialMode) -> Result<(Endpoint, EndpointAddr), String> {
+pub async fn dial_plan(
+    addr: &EndpointAddr,
+    mode: DialMode,
+) -> Result<(Endpoint, EndpointAddr), String> {
     let peer = filtered_addr(addr, mode)?;
     let relays: Vec<RelayUrl> = addr.relay_urls().cloned().collect();
     let endpoint = dial_endpoint(&relays, mode).await?;
@@ -493,7 +527,10 @@ pub async fn connect(
         .map_err(|e| format!("iroh connect: {e}"))?;
     // `accept_bi` on the far side only resolves once we send data;
     // peerline's first client frame does that, so no priming write.
-    let (send, recv) = conn.open_bi().await.map_err(|e| format!("iroh open_bi: {e}"))?;
+    let (send, recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| format!("iroh open_bi: {e}"))?;
     info!(remote = %conn.remote_id(), "peerline-iroh dialed");
 
     let (sink, stream) = text_frames(tokio::io::join(recv, send));
@@ -511,8 +548,7 @@ pub async fn connect(
 /// Drive one accepted connection: each bi-stream the client opens becomes
 /// its own peer session (looping keeps the connection alive across a
 /// reconnect).
-async fn serve_conn(conn: Connection, handler: PeerHandler)
-{
+async fn serve_conn(conn: Connection, handler: PeerHandler) {
     let remote = conn.remote_id();
     info!(%remote, "peerline-iroh connection opened");
     loop {
@@ -559,10 +595,17 @@ mod tests {
 
     #[test]
     fn dial_mode_wire_strings_round_trip_and_typos_fail() {
-        for (wire, mode) in [("auto", DialMode::Auto), ("relay", DialMode::Relay), ("direct", DialMode::Direct)] {
+        for (wire, mode) in [
+            ("auto", DialMode::Auto),
+            ("relay", DialMode::Relay),
+            ("direct", DialMode::Direct),
+        ] {
             let parsed: DialMode = serde_json::from_str(&format!("\"{wire}\"")).expect(wire);
             assert_eq!(parsed, mode);
-            assert_eq!(serde_json::to_string(&mode).expect(wire), format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::to_string(&mode).expect(wire),
+                format!("\"{wire}\"")
+            );
         }
         // A typo'd mode must fail loudly, never silently behave like Auto.
         assert!(serde_json::from_str::<DialMode>("\"relayy\"").is_err());
@@ -573,7 +616,9 @@ mod tests {
         let id = SecretKey::generate().public();
         let relay: RelayUrl = "http://relay.example:3340".parse().expect("relay url");
         let ip: std::net::SocketAddr = "192.168.1.10:6466".parse().expect("ip");
-        let full = EndpointAddr::from(id).with_relay_url(relay.clone()).with_ip_addr(ip);
+        let full = EndpointAddr::from(id)
+            .with_relay_url(relay.clone())
+            .with_ip_addr(ip);
 
         // Auto keeps everything.
         let auto = filtered_addr(&full, DialMode::Auto).expect("auto");

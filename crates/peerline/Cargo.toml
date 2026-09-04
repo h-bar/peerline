@@ -1,0 +1,48 @@
+[package]
+name = "peerline"
+description = "Peer-symmetric bidirectional RPC toolkit — typed request/response/notification/stream envelopes with a pubsub layer, version-tagged JSON wire format, plus an optional stateful Peer runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["rpc", "bidirectional", "peer-to-peer", "streaming", "protocol"]
+categories = ["network-programming", "asynchronous", "encoding"]
+
+[features]
+default = []
+# Stateful Peer with call / notify / stream / handler registry,
+# built on `futures::channel`. Runtime-agnostic — works on tokio,
+# async-std, smol, and wasm. Opt in if you want the `runtime`
+# module; leave off for pure wire types only.
+runtime = ["dep:futures", "dep:thiserror"]
+# TypeScript type generation (ts-rs). Build-time only: enabling it adds
+# `#[derive(TS)]` to the wire payload types and compiles the `wire::ts`
+# mirror module, whose sole job is to state the wire shape for the exporter.
+# Nothing in a normal build depends on it, and `ts-rs` is absent from a
+# default dependency tree.
+#
+# This crate is the *source* of the TypeScript wire types but not their
+# destination: the bindings are committed in the `peerline-ts` repository and
+# regenerated from `peerline-conformance`, which is the only place that can
+# see both languages at once (`just bindings` there). Running
+# `cargo test --features ts-export export_bindings` here just writes them
+# under `target/` — see `.cargo/config.toml`.
+ts-export = ["dep:ts-rs"]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+# `serde-json-impl` is required: `serde_json::Value` / `Map<String, Value>`
+# appear in the exported types (RpcError::data, pubsub event payloads,
+# the `args` mirrors).
+ts-rs = { version = "12", features = ["serde-json-impl"], optional = true }
+# futures::channel (mpsc/oneshot) + FuturesUnordered let us run
+# handlers concurrently without needing a runtime's spawn primitive.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+# Drives the loopback driver in tests under the `runtime` feature.
+tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }

@@ -7,8 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets;
 use iroh::Endpoint;
+use iroh::endpoint::presets;
 use iroh_base::{EndpointAddr, SecretKey};
 use peerline_transport_iroh::IrohConfig;
 
@@ -19,8 +19,8 @@ async fn main() {
     let urls: Vec<String> = std::env::args().skip(1).collect();
     let urls = if urls.is_empty() {
         vec![
-            "http://127.0.0.1:9".to_string(),      // closed port -> RST
-            "http://192.0.2.1:3340".to_string(),   // blackhole -> timeout
+            "http://127.0.0.1:9".to_string(),        // closed port -> RST
+            "http://192.0.2.1:3340".to_string(),     // blackhole -> timeout
             "http://106.15.43.194:9999".to_string(), // real host, closed port
         ]
     } else {
@@ -42,17 +42,31 @@ async fn main() {
         }
         let ep = builder.bind().await.expect("bind");
         let t0 = Instant::now();
-        let outcome = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, PROBE_ALPN)).await;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, PROBE_ALPN)).await;
         let ms = t0.elapsed().as_millis();
         let (verdict, detail) = match outcome {
             Ok(Ok(_)) => ("reachable (connected)", "connected".to_string()),
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let low = msg.to_lowercase();
-                let dead = ["timed out", "timeout", "no route", "unreachable", "no known", "no working", "no path", "no addr"]
-                    .iter()
-                    .any(|k| low.contains(k));
-                if dead { ("UNREACHABLE", msg) } else { ("reachable (FALSE GREEN?)", msg) }
+                let dead = [
+                    "timed out",
+                    "timeout",
+                    "no route",
+                    "unreachable",
+                    "no known",
+                    "no working",
+                    "no path",
+                    "no addr",
+                ]
+                .iter()
+                .any(|k| low.contains(k));
+                if dead {
+                    ("UNREACHABLE", msg)
+                } else {
+                    ("reachable (FALSE GREEN?)", msg)
+                }
             }
             Err(_) => ("UNREACHABLE (probe timeout)", "timed out".into()),
         };

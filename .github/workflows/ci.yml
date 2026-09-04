@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI without putting a `deny` attribute in the source,
+  # which would make a warning-producing `cargo build` fail for consumers too.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      # `--workspace` alone would test the core crate with default features
+      # only, silently skipping every `runtime`-gated test. The transports
+      # pull `runtime` in via feature unification, but don't rely on that.
+      - run: cargo test --workspace --all-features
+
+  # The published tarball is its own artifact: it has different contents from
+  # the working tree (excludes, and files outside the package root), so it can
+  # break while the workspace is green.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Only `peerline`: the transports depend on it by version as well as by
+      # path, so packaging them resolves that requirement against the crates.io
+      # index and fails until `peerline` is actually published. They are
+      # verified by the release itself, which publishes in dependency order.
+      # See RELEASING.md.
+      - run: cargo package -p peerline

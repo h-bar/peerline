@@ -8,8 +8,8 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use iroh::endpoint::presets;
 use iroh::Endpoint;
+use iroh::endpoint::presets;
 use iroh_base::{EndpointAddr, SecretKey};
 use peerline_transport_iroh::IrohConfig;
 
@@ -41,8 +41,14 @@ async fn main() {
     let addr = server.addr();
     let relays: Vec<_> = addr.relay_urls().cloned().collect();
     let directs: Vec<_> = addr.ip_addrs().copied().collect();
-    println!("server id={} relays={relays:?} directs={directs:?}", addr.id);
-    assert!(!relays.is_empty(), "server acquired no relay — is the relay up?");
+    println!(
+        "server id={} relays={relays:?} directs={directs:?}",
+        addr.id
+    );
+    assert!(
+        !relays.is_empty(),
+        "server acquired no relay — is the relay up?"
+    );
 
     let server_task = tokio::spawn({
         let server = server.clone();
@@ -63,9 +69,9 @@ async fn main() {
     });
 
     // Case 1: relay-only addr (what the probe dials).
-    let relay_only = relays
-        .iter()
-        .fold(EndpointAddr::from(addr.id), |a, r| a.with_relay_url(r.clone()));
+    let relay_only = relays.iter().fold(EndpointAddr::from(addr.id), |a, r| {
+        a.with_relay_url(r.clone())
+    });
     dial(&cfg, "relay-only", relay_only).await;
 
     // Case 2: relay + blackholed direct addrs (what an off-LAN client
@@ -74,9 +80,9 @@ async fn main() {
         "192.0.2.1:41234".parse().unwrap(),
         "192.0.2.2:41234".parse().unwrap(),
     ];
-    let mut mixed = relays
-        .iter()
-        .fold(EndpointAddr::from(addr.id), |a, r| a.with_relay_url(r.clone()));
+    let mut mixed = relays.iter().fold(EndpointAddr::from(addr.id), |a, r| {
+        a.with_relay_url(r.clone())
+    });
     for b in blackholes {
         mixed = mixed.with_ip_addr(b);
     }
@@ -106,10 +112,7 @@ async fn dial(cfg: &IrohConfig, label: &str, addr: EndpointAddr) {
                     )
                 })
                 .collect();
-            println!(
-                "   OK in {:?} — paths: {paths:?}",
-                t0.elapsed()
-            );
+            println!("   OK in {:?} — paths: {paths:?}", t0.elapsed());
         }
         Ok(Err(e)) => println!("   FAILED in {:?}: {e}", t0.elapsed()),
         Err(_) => println!("   TIMED OUT after {:?}", t0.elapsed()),

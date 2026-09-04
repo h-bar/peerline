@@ -1,4 +1,7 @@
 /target
+# Belt and braces: each JS package also ignores its own, but a package
+# directory being removed must not un-ignore what is left behind.
+node_modules/
 **/*.rs.bk
 .DS_Store
 

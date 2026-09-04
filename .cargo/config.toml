@@ -1,0 +1,14 @@
+# `cargo test --all-features` runs the ts-rs `export_bindings_*` tests, which
+# write TypeScript declarations somewhere. This repository is the Rust
+# implementation alone and has no use for them, so send them into `target/`
+# (already ignored) rather than let ts-rs scatter its default `./bindings`
+# directory next to the source.
+#
+# The bindings that matter are the ones committed in the `peerline-ts`
+# repository. Those are produced from `peerline-conformance`, whose own
+# `.cargo/config.toml` overrides this value — it is the one place that can see
+# both languages at once. See `just bindings` there.
+#
+# `relative = true` resolves against this file's grandparent, the repo root.
+[env]
+TS_RS_EXPORT_DIR = { value = "target/ts-bindings-scratch", relative = true }

@@ -1,9 +1,0 @@
-[package]
-name = "peerline-manager-protocol"
-description = "Wire schema for the peerline service manager — register / list / lookup shapes plus the `manager.*` method-name constants. Pure JSON types, no transport, no runtime; hosts depend on it to report in, clients to query."
-version = "0.0.6"
-edition = "2024"
-license = "MIT"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
