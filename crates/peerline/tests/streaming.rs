@@ -277,3 +277,16 @@ fn stream_does_not_match_response_or_request_shapes() {
     let req_frame = peer::parse_frame(r#"{"ver":"1","kind":"req","id":1,"op":"x"}"#).unwrap();
     assert!(matches!(req_frame, Frame::V1(Content::Request(_))));
 }
+
+/// `seq` is signed on the wire because `-1` is the terminal sentinel, so
+/// a `u64` past `i64::MAX` must be refused rather than cast: `u64::MAX`
+/// wraps to exactly `-1`, which would turn an item into an
+/// end-of-stream frame.
+#[test]
+fn stream_item_rejects_seq_past_i64_max() {
+    assert!(peer::stream_item(1u64, i64::MAX as u64, &"x").is_ok());
+    for seq in [i64::MAX as u64 + 1, u64::MAX] {
+        let err = peer::stream_item(1u64, seq, &"x").expect_err("seq must be rejected");
+        assert!(err.to_string().contains("seq"), "unexpected error: {err}");
+    }
+}

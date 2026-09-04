@@ -303,14 +303,23 @@ impl RequestIdGen {
 /// (the first item implicitly opens the stream).
 /// Non-consecutive `seq`s between items signal drops the producer
 /// advanced past (see [`crate::runtime::StreamSender::skip`]).
+///
+/// Errors if `data` fails to serialize, or if `seq` exceeds
+/// [`i64::MAX`]: `seq` is signed on the wire because `-1` is the
+/// terminal sentinel, so a wrapping cast would turn a large item `seq`
+/// into a negative one — and `u64::MAX` into `-1` exactly, silently
+/// converting an item into an end-of-stream frame.
 pub fn stream_item<T: Serialize>(
     id: impl Into<Id>,
     seq: u64,
     data: &T,
 ) -> Result<StreamFrame, serde_json::Error> {
+    let seq = i64::try_from(seq).map_err(|_| {
+        <serde_json::Error as serde::ser::Error>::custom("stream seq exceeds i64::MAX")
+    })?;
     Ok(StreamFrame {
         id: id.into(),
-        seq: seq as i64,
+        seq,
         data: Some(RawJson::from_serialize(data)?),
         error: None,
     })
