@@ -14,7 +14,6 @@ categories = ["network-programming", "asynchronous", "web-programming::websocket
 # Pinned to the same tungstenite major axum re-exports so only one copy of
 # the WS protocol code is linked.
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.7", features = ["cors"] }
 tokio-tungstenite = "0.29"
 futures = "0.3"
 tokio = { version = "1", features = ["net", "rt"] }
@@ -23,6 +22,7 @@ tracing = "0.1"
 peerline = { workspace = true, features = ["runtime"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 

@@ -28,21 +28,183 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{debug, info, warn};
 
-/// A type-erased per-connection peer initializer — the `on_peer` closure
-/// after boxing, so a routing table can hold heterogeneous services.
+/// A type-erased per-connection peer initializer — the closure that
+/// registers a service's handlers, after boxing.
 pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
 
+// ---------------------------------------------------------------------------
+// UdsAccept — the connection's facts
+// ---------------------------------------------------------------------------
+
+/// Credentials of the process on the other end, as the kernel reports
+/// them. Handed to an [`Acceptor`] to screen the connection.
+///
+/// Unforgeable: the peer cannot claim someone else's uid. This is the one
+/// peerline transport that authenticates a *user*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdsAccept {
+    uid: u32,
+    gid: u32,
+    pid: Option<i32>,
+}
+
+impl UdsAccept {
+    /// Effective user id of the connecting process, at connect time.
+    #[must_use]
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// Effective group id of the connecting process.
+    #[must_use]
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// Process id, where the platform reports one.
+    ///
+    /// Useful for logging and correlation, **not** for authorization: pids
+    /// are reused, so anything resolved from one (an executable path, a
+    /// cgroup) is a time-of-check/time-of-use trap. Decide on
+    /// [`uid`](Self::uid).
+    #[must_use]
+    pub fn pid(&self) -> Option<i32> {
+        self.pid
+    }
+}
+
+/// Screens one connection: given its [`UdsAccept`] credentials, either
+/// admit it — returning the initializer to run on the resulting peer — or
+/// refuse with a reason.
+///
+/// A refusal drops the stream and logs `reason`, before a `Peer` exists
+/// and before one frame is dispatched.
+///
+/// The socket file is published `0600`, and both Linux and macOS require
+/// write permission on it to `connect(2)`, so the kernel already limits
+/// this to the same user. Credentials are what let a policy say something
+/// *more* than that — and are defence in depth if the socket ends up
+/// somewhere with looser permissions than intended.
+pub type Acceptor = Arc<dyn Fn(&UdsAccept) -> Result<PeerHandler, String> + Send + Sync + 'static>;
+
+// ---------------------------------------------------------------------------
+// UdsPolicy — the common decisions, as a value
+// ---------------------------------------------------------------------------
+
+type CustomCheck = Arc<dyn Fn(&UdsAccept) -> Result<(), String> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+enum Rule {
+    AllowAny,
+    SameUser,
+    Users(Arc<[u32]>),
+    Custom(CustomCheck),
+}
+
+/// A reusable admission policy. A value rather than a closure, so a mount
+/// table can carry it.
+#[derive(Clone)]
+pub struct UdsPolicy(Rule);
+
+impl Default for UdsPolicy {
+    fn default() -> Self {
+        Self::same_user()
+    }
+}
+
+impl UdsPolicy {
+    /// Admit connections from this process's own effective uid, and from
+    /// root — which the `0600` socket admits regardless, so refusing it
+    /// would be theatre that only breaks administrative tooling.
+    ///
+    /// The default, and the same set the socket's permissions already
+    /// allow, so this changes nothing on a correctly published socket and
+    /// catches the case where it was not.
+    #[must_use]
+    pub fn same_user() -> Self {
+        Self(Rule::SameUser)
+    }
+
+    /// Admit connections from any of `uids`.
+    #[must_use]
+    pub fn users<I: IntoIterator<Item = u32>>(uids: I) -> Self {
+        Self(Rule::Users(uids.into_iter().collect()))
+    }
+
+    /// Admit every connection, relying on the socket's file permissions
+    /// alone.
+    #[must_use]
+    pub fn allow_any() -> Self {
+        Self(Rule::AllowAny)
+    }
+
+    /// Decide with `f`.
+    #[must_use]
+    pub fn custom<F>(f: F) -> Self
+    where
+        F: Fn(&UdsAccept) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self(Rule::Custom(Arc::new(f)))
+    }
+
+    /// Apply the policy. `Err(reason)` refuses the connection.
+    pub fn check(&self, accept: &UdsAccept) -> Result<(), String> {
+        match &self.0 {
+            Rule::AllowAny => Ok(()),
+            Rule::SameUser => {
+                let me = rustix::process::geteuid().as_raw();
+                if accept.uid() == me || accept.uid() == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("uid {} is not {me} or root", accept.uid()))
+                }
+            }
+            Rule::Users(uids) => {
+                if uids.contains(&accept.uid()) {
+                    Ok(())
+                } else {
+                    Err(format!("uid {} not permitted", accept.uid()))
+                }
+            }
+            Rule::Custom(f) => f(accept),
+        }
+    }
+
+    /// Pair this policy with a peer initializer, giving the closure
+    /// [`serve`] wants. Wrap in [`Arc`] for a [`serve_mounted`] table.
+    pub fn acceptor<F>(
+        self,
+        on_peer: F,
+    ) -> impl Fn(&UdsAccept) -> Result<PeerHandler, String> + Send + Sync + 'static
+    where
+        F: Fn(&Peer) + Send + Sync + 'static,
+    {
+        let on_peer: PeerHandler = Arc::new(on_peer);
+        move |accept: &UdsAccept| {
+            self.check(accept)?;
+            Ok(on_peer.clone())
+        }
+    }
+}
+
 /// Bind to `path` and serve peerline over a Unix domain socket forever,
-/// driving one [`peerline::runtime::Peer`] per accepted connection —
-/// configured by `on_peer` (register your handlers there). The socket is
-/// published owner-only (`0600` on unix), so only the same user can
-/// connect; see [`serve_mounted`] for exactly what that guarantees, and
-/// prefer a directory only this user can write.
-pub async fn serve<F>(path: impl AsRef<Path>, on_peer: F) -> Result<(), String>
+/// driving one [`peerline::runtime::Peer`] per admitted connection,
+/// screening each with `acceptor`. The socket is published owner-only
+/// (`0600` on unix), so only the same user can connect; see
+/// [`serve_mounted`] for exactly what that guarantees, and prefer a
+/// directory only this user can write.
+///
+/// ```ignore
+/// serve("/run/app.sock", UdsPolicy::same_user().acceptor(|peer| {
+///     peer.on_request("ping", |_: ()| async { Ok::<_, RpcError>("pong") });
+/// }))
+/// .await
+/// ```
+pub async fn serve<F>(path: impl AsRef<Path>, acceptor: F) -> Result<(), String>
 where
-    F: Fn(&Peer) + Clone + Send + Sync + 'static,
+    F: Fn(&UdsAccept) -> Result<PeerHandler, String> + Send + Sync + 'static,
 {
-    serve_one(path.as_ref().to_path_buf(), Arc::new(on_peer)).await
+    serve_one(path.as_ref().to_path_buf(), Arc::new(acceptor)).await
 }
 
 /// Serve several peerline services over a Unix domain socket, **mounted by
@@ -63,10 +225,10 @@ where
 /// group/world-writable, and the socket should anyway live in a directory
 /// only this user can write — put it there and the question does not
 /// arise.
-pub async fn serve_mounted(mounts: Vec<(PathBuf, PeerHandler)>) -> Result<(), String> {
+pub async fn serve_mounted(mounts: Vec<(PathBuf, Acceptor)>) -> Result<(), String> {
     let listeners = mounts
         .into_iter()
-        .map(|(path, handler)| serve_one(path, handler));
+        .map(|(path, acceptor)| serve_one(path, acceptor));
     futures::future::try_join_all(listeners).await.map(|_| ())
 }
 
@@ -199,9 +361,9 @@ async fn ensure_staging_is_not_a_symlink(staging: &Path) -> Result<(), String> {
 }
 
 /// One UDS listener: publish `path` owner-only, then accept forever,
-/// driving `handler` per connection. The shared core behind both
+/// screening each connection with `acceptor`. The shared core behind both
 /// [`serve`] and [`serve_mounted`].
-async fn serve_one(path: PathBuf, handler: PeerHandler) -> Result<(), String> {
+async fn serve_one(path: PathBuf, acceptor: Acceptor) -> Result<(), String> {
     let listener = bind_owner_only(&path).await?;
     info!(socket = %path.display(), "peerline-uds listening");
 
@@ -216,8 +378,12 @@ async fn serve_one(path: PathBuf, handler: PeerHandler) -> Result<(), String> {
                 continue;
             }
         };
-        let handler = handler.clone();
-        tokio::spawn(async move { serve_conn(stream, handler).await });
+        // Screening happens in the connection's own task, not here: an
+        // acceptor is caller-supplied, and one that takes its time must
+        // not hold up every other pending accept on this socket.
+        let acceptor = acceptor.clone();
+        let socket = path.clone();
+        tokio::spawn(async move { screen_and_serve(stream, socket, &acceptor).await });
     }
 }
 
@@ -236,12 +402,46 @@ pub async fn connect(path: impl AsRef<Path>) -> Result<(Peer, BoxFuture<'static,
     Ok((peer, Box::pin(driver)))
 }
 
-/// Drive one accepted connection: newline-delimited frames into a
+/// Screen one accepted connection, then serve it if admitted.
+async fn screen_and_serve(stream: UnixStream, socket: PathBuf, acceptor: &Acceptor) {
+    // Credentials are the whole point of screening here, so a socket that
+    // cannot report them is refused rather than served blind.
+    let accept = match peer_credentials(&stream) {
+        Ok(accept) => accept,
+        Err(e) => {
+            warn!(socket = %socket.display(), error = %e,
+                  "peerline-uds: no peer credentials; refusing");
+            return;
+        }
+    };
+    match acceptor(&accept) {
+        Ok(init) => serve_conn(stream, init).await,
+        Err(reason) => warn!(
+            socket = %socket.display(),
+            uid = accept.uid(),
+            pid = ?accept.pid(),
+            %reason,
+            "peerline-uds connection refused"
+        ),
+    }
+}
+
+/// The connecting process's credentials, as the kernel reports them.
+fn peer_credentials(stream: &UnixStream) -> Result<UdsAccept, std::io::Error> {
+    let cred = stream.peer_cred()?;
+    Ok(UdsAccept {
+        uid: cred.uid(),
+        gid: cred.gid(),
+        pid: cred.pid(),
+    })
+}
+
+/// Drive one admitted connection: newline-delimited frames into a
 /// [`Peer`], run the handler set, then drive until it ends.
-async fn serve_conn(stream: UnixStream, handler: PeerHandler) {
+async fn serve_conn(stream: UnixStream, init: PeerHandler) {
     debug!("peerline-uds connection opened");
     let (peer, driver) = peer_over(stream);
-    handler(&peer);
+    init(&peer);
     driver.await;
     debug!("peerline-uds connection closed");
 }
@@ -357,6 +557,78 @@ mod tests {
         assert!(ensure_staging_is_not_a_symlink(&staging).await.is_ok());
         drop(listener);
         let _ = std::fs::remove_file(&staging);
+    }
+
+    fn accept_as(uid: u32) -> UdsAccept {
+        UdsAccept {
+            uid,
+            gid: 20,
+            pid: Some(1),
+        }
+    }
+
+    /// `same_user` admits this process and root, and nobody else.
+    #[test]
+    fn same_user_admits_self_and_root_only() {
+        let me = rustix::process::geteuid().as_raw();
+        let p = UdsPolicy::same_user();
+        assert!(p.check(&accept_as(me)).is_ok());
+        assert!(p.check(&accept_as(0)).is_ok());
+        let err = p
+            .check(&accept_as(me.wrapping_add(1)))
+            .expect_err("another uid must be refused");
+        assert!(err.contains("not"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn users_policy_is_an_allowlist() {
+        let p = UdsPolicy::users([501, 502]);
+        assert!(p.check(&accept_as(501)).is_ok());
+        assert!(p.check(&accept_as(503)).is_err());
+        assert!(UdsPolicy::allow_any().check(&accept_as(999)).is_ok());
+    }
+
+    /// A refused connection reaches no op: the client's call fails rather
+    /// than being answered.
+    #[tokio::test]
+    async fn refused_connection_dispatches_no_frames() {
+        let path = temp_socket("refuse");
+        let serve_path = path.clone();
+        let server = tokio::spawn(async move {
+            serve(&serve_path, |accept: &UdsAccept| {
+                assert_ne!(accept.uid(), u32::MAX, "credentials should be readable");
+                Err::<PeerHandler, _>("not today".to_string())
+            })
+            .await
+        });
+
+        let mut connected = None;
+        for _ in 0..200 {
+            if let Ok(c) = connect(&path).await {
+                connected = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (peer, driver) = connected.expect("server should accept a connection");
+        tokio::spawn(driver);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.call::<_, String>("ping", &serde_json::json!({})),
+        )
+        .await
+        .expect("call must not hang")
+        .expect_err("a refused connection must not answer");
+        // Specifically *closed*, not merely an error: a regression that
+        // served the connection with no handlers registered would answer
+        // `MethodNotFound`, which is also an `Err`.
+        assert!(
+            err.to_string().contains("closed"),
+            "expected the connection to be dropped, got: {err}"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Publishing is a rename onto the target, so an existing socket at

@@ -44,7 +44,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
-pub use iroh_base::{EndpointAddr, RelayUrl, SecretKey};
+pub use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 
 /// Human-facing ticket prefix — service-neutral, so every peerline-iroh
 /// ticket is recognizable at a glance and cannot be confused with a
@@ -71,9 +71,141 @@ pub fn decode_ticket(ticket: &str) -> Result<EndpointAddr, String> {
     postcard::from_bytes(&bytes).map_err(|e| format!("iroh ticket decode: {e}"))
 }
 
-/// A type-erased per-connection peer initializer — the `on_peer` closure
-/// after boxing, so a routing table can hold heterogeneous services.
+/// A type-erased per-connection peer initializer — the closure that
+/// registers a service's handlers, after boxing.
 pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
+
+// ---------------------------------------------------------------------------
+// IrohAccept — the connection's facts
+// ---------------------------------------------------------------------------
+
+/// What is known about an accepted connection once its QUIC handshake has
+/// completed. Handed to an [`Acceptor`] to screen the peer.
+#[derive(Debug, Clone)]
+pub struct IrohAccept {
+    remote: EndpointId,
+    alpn: Vec<u8>,
+}
+
+impl IrohAccept {
+    /// The remote's endpoint identity, **proved** by the QUIC/TLS
+    /// handshake — the peer demonstrated possession of the private key, it
+    /// did not merely claim the id. The strongest identity any peerline
+    /// transport carries.
+    ///
+    /// Note what it is not: possession of a *ticket* proves nothing. A
+    /// ticket is an address — it travels through logs, pastes and QR codes
+    /// — so "holds a ticket" is not an authorization. Compare this against
+    /// endpoints you have decided to trust.
+    #[must_use]
+    pub fn remote_id(&self) -> EndpointId {
+        self.remote
+    }
+
+    /// The ALPN the peer negotiated — the mount, when several are served
+    /// by [`serve_mounted`].
+    #[must_use]
+    pub fn alpn(&self) -> &[u8] {
+        &self.alpn
+    }
+}
+
+/// QUIC application close code sent when an [`Acceptor`] refuses a peer.
+///
+/// A dialer holding the raw [`Connection`] can read it from the close
+/// reason and tell refusal from a transport failure. [`connect`] does not
+/// surface it structurally — it renders connection failures as strings —
+/// so matching on it means driving the endpoint yourself.
+pub const CLOSE_REFUSED: u32 = 4403;
+
+/// Screens one connection: given its [`IrohAccept`] facts, either admit it
+/// — returning the initializer to run on each of its peer sessions — or
+/// refuse with a reason.
+///
+/// A refusal closes the whole QUIC connection with [`CLOSE_REFUSED`] and
+/// logs `reason`, before any bi-stream is accepted and before a `Peer`
+/// exists. Screening is per connection because that is where the identity
+/// lives and where it is fixed; the returned initializer then runs once
+/// per bi-stream, each of which is its own peer session.
+pub type Acceptor = Arc<dyn Fn(&IrohAccept) -> Result<PeerHandler, String> + Send + Sync + 'static>;
+
+// ---------------------------------------------------------------------------
+// IrohPolicy — the common decisions, as a value
+// ---------------------------------------------------------------------------
+
+type CustomCheck = Arc<dyn Fn(&IrohAccept) -> Result<(), String> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+enum Rule {
+    AnyTicketHolder,
+    Endpoints(Arc<[EndpointId]>),
+    Custom(CustomCheck),
+}
+
+/// A reusable admission policy. A value rather than a closure, so a mount
+/// table can carry it.
+#[derive(Clone)]
+pub struct IrohPolicy(Rule);
+
+impl IrohPolicy {
+    /// Admit only these endpoint ids.
+    #[must_use]
+    pub fn endpoints<I: IntoIterator<Item = EndpointId>>(ids: I) -> Self {
+        Self(Rule::Endpoints(ids.into_iter().collect()))
+    }
+
+    /// Admit anyone who can reach the endpoint on a mounted ALPN.
+    ///
+    /// Named to be uncomfortable, because it is: a ticket is an address,
+    /// not a credential, so this grants every op to anyone the ticket ever
+    /// reached. Reasonable when the ticket never leaves one machine, or
+    /// when the service exposes nothing worth protecting.
+    #[must_use]
+    pub fn any_ticket_holder() -> Self {
+        Self(Rule::AnyTicketHolder)
+    }
+
+    /// Decide with `f` — the seam for a dynamic allowlist, e.g. one behind
+    /// an `Arc<RwLock<HashSet<EndpointId>>>` that a pairing flow updates.
+    #[must_use]
+    pub fn custom<F>(f: F) -> Self
+    where
+        F: Fn(&IrohAccept) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self(Rule::Custom(Arc::new(f)))
+    }
+
+    /// Apply the policy. `Err(reason)` refuses the connection.
+    pub fn check(&self, accept: &IrohAccept) -> Result<(), String> {
+        match &self.0 {
+            Rule::AnyTicketHolder => Ok(()),
+            Rule::Endpoints(ids) => {
+                if ids.contains(&accept.remote_id()) {
+                    Ok(())
+                } else {
+                    Err(format!("endpoint {} not permitted", accept.remote_id()))
+                }
+            }
+            Rule::Custom(f) => f(accept),
+        }
+    }
+
+    /// Pair this policy with a peer initializer, giving the closure
+    /// [`serve`] wants. Wrap in [`Arc`] for a [`serve_mounted`] table.
+    pub fn acceptor<F>(
+        self,
+        on_peer: F,
+    ) -> impl Fn(&IrohAccept) -> Result<PeerHandler, String> + Send + Sync + 'static
+    where
+        F: Fn(&Peer) + Send + Sync + 'static,
+    {
+        let on_peer: PeerHandler = Arc::new(on_peer);
+        move |accept: &IrohAccept| {
+            self.check(accept)?;
+            Ok(on_peer.clone())
+        }
+    }
+}
 
 /// A length-delimited text-frame sink over the QUIC duplex.
 pub type FrameSink = Pin<Box<dyn Sink<String, Error = io::Error> + Send>>;
@@ -241,6 +373,9 @@ impl IrohConfig {
 /// ALPN is the caller's service id; it must match what the dial side
 /// passes to `connect`.
 ///
+/// Each connection is screened by `acceptor` before any bi-stream is
+/// accepted; see [`Acceptor`] and [`IrohPolicy`].
+///
 /// NOTE — the `Peer` is built LAZILY, only after `accept_bi` resolves,
 /// which (per QUIC) happens once the client sends its first frame. This
 /// relies on the client speaking first — true for peerline's RPC. A
@@ -250,17 +385,17 @@ pub async fn serve<T, F>(
     secret_key: SecretKey,
     config: IrohConfig,
     on_ticket: T,
-    on_peer: F,
+    acceptor: F,
 ) -> Result<(), String>
 where
     T: FnOnce(&str),
-    F: Fn(&Peer) + Clone + Send + Sync + 'static,
+    F: Fn(&IrohAccept) -> Result<PeerHandler, String> + Send + Sync + 'static,
 {
     serve_mounted(
         secret_key,
         config,
         on_ticket,
-        vec![(alpn.to_vec(), Arc::new(on_peer))],
+        vec![(alpn.to_vec(), Arc::new(acceptor))],
     )
     .await
 }
@@ -276,7 +411,7 @@ pub async fn serve_mounted<T>(
     secret_key: SecretKey,
     config: IrohConfig,
     on_ticket: T,
-    mounts: Vec<(Vec<u8>, PeerHandler)>,
+    mounts: Vec<(Vec<u8>, Acceptor)>,
 ) -> Result<(), String>
 where
     T: FnOnce(&str),
@@ -359,7 +494,7 @@ where
             // Route to the service whose ALPN the client negotiated.
             let alpn = conn.alpn();
             match mounts.iter().find(|(a, _)| a == alpn) {
-                Some((_, handler)) => serve_conn(conn, handler.clone()).await,
+                Some((_, acceptor)) => serve_conn(conn, acceptor.clone()).await,
                 None => warn!(alpn = ?alpn, "peerline-iroh: no mount for negotiated ALPN"),
             }
         });
@@ -545,20 +680,36 @@ pub async fn connect(
     Ok((peer, Box::pin(driver)))
 }
 
-/// Drive one accepted connection: each bi-stream the client opens becomes
-/// its own peer session (looping keeps the connection alive across a
-/// reconnect).
-async fn serve_conn(conn: Connection, handler: PeerHandler) {
-    let remote = conn.remote_id();
-    info!(%remote, "peerline-iroh connection opened");
+/// Screen one accepted connection, then drive it: each bi-stream the
+/// client opens becomes its own peer session (looping keeps the
+/// connection alive across a reconnect).
+///
+/// The acceptor runs once, here — the identity and ALPN it judges are
+/// fixed for the connection's lifetime, so a refusal could never come out
+/// differently for a later bi-stream, and refusing the whole connection
+/// stops a rejected peer from opening more.
+async fn serve_conn(conn: Connection, acceptor: Acceptor) {
+    let accept = IrohAccept {
+        remote: conn.remote_id(),
+        alpn: conn.alpn().to_vec(),
+    };
+    let init = match acceptor(&accept) {
+        Ok(init) => init,
+        Err(reason) => {
+            warn!(remote = %accept.remote_id(), %reason, "peerline-iroh connection refused");
+            conn.close(CLOSE_REFUSED.into(), b"refused");
+            return;
+        }
+    };
+    info!(remote = %accept.remote_id(), "peerline-iroh connection opened");
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                let handler = handler.clone();
-                tokio::spawn(async move { drive_stream(send, recv, handler).await });
+                let init = init.clone();
+                tokio::spawn(async move { drive_stream(send, recv, init).await });
             }
             Err(e) => {
-                info!(%remote, error = %e, "peerline-iroh connection closed");
+                info!(remote = %accept.remote_id(), error = %e, "peerline-iroh connection closed");
                 break;
             }
         }
@@ -567,10 +718,10 @@ async fn serve_conn(conn: Connection, handler: PeerHandler) {
 
 /// Bridge one bi-stream to a peerline [`Peer`] via the shared text-frame
 /// codec, run the handler set, then drive until it ends.
-async fn drive_stream(send: SendStream, recv: RecvStream, handler: PeerHandler) {
+async fn drive_stream(send: SendStream, recv: RecvStream, init: PeerHandler) {
     let (sink, stream) = text_frames(tokio::io::join(recv, send));
     let (peer, driver) = Peer::new(sink, stream);
-    handler(&peer);
+    init(&peer);
     driver.await;
 }
 
@@ -650,5 +801,140 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains(TICKET_PREFIX), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn accept_from(id: EndpointId) -> IrohAccept {
+        IrohAccept {
+            remote: id,
+            alpn: b"test/1".to_vec(),
+        }
+    }
+
+    /// The endpoint allowlist is the whole point: ticket possession is an
+    /// address, not a credential, so an unlisted peer that dialled the
+    /// ticket successfully must still be refused.
+    #[test]
+    fn endpoint_policy_is_an_allowlist() {
+        let allowed = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let p = IrohPolicy::endpoints([allowed]);
+        assert!(p.check(&accept_from(allowed)).is_ok());
+        let err = p
+            .check(&accept_from(other))
+            .expect_err("an unlisted endpoint must be refused");
+        assert!(err.contains("not permitted"), "unexpected: {err}");
+        // The escape hatch admits it.
+        assert!(
+            IrohPolicy::any_ticket_holder()
+                .check(&accept_from(other))
+                .is_ok()
+        );
+    }
+
+    /// A dynamic allowlist needs no dedicated API — `custom` over shared
+    /// state is the pairing-flow seam.
+    #[test]
+    fn custom_policy_can_be_updated_at_runtime() {
+        use std::collections::HashSet;
+        use std::sync::RwLock;
+
+        let paired: Arc<RwLock<HashSet<EndpointId>>> = Arc::new(RwLock::new(HashSet::new()));
+        let p = {
+            let paired = paired.clone();
+            IrohPolicy::custom(move |a: &IrohAccept| {
+                if paired.read().unwrap().contains(&a.remote_id()) {
+                    Ok(())
+                } else {
+                    Err("not paired".into())
+                }
+            })
+        };
+        let id = SecretKey::generate().public();
+        assert!(p.check(&accept_from(id)).is_err());
+        paired.write().unwrap().insert(id);
+        assert!(p.check(&accept_from(id)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    const ALPN: &[u8] = b"peerline/refusal-test/1";
+
+    /// Bind a relay-free endpoint that only talks over direct addresses —
+    /// enough for two endpoints on this machine, and it keeps the test off
+    /// the network entirely.
+    async fn local_endpoint(alpns: Vec<Vec<u8>>) -> Endpoint {
+        let mut builder = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled);
+        if !alpns.is_empty() {
+            builder = builder.alpns(alpns);
+        }
+        builder.bind().await.expect("bind local endpoint")
+    }
+
+    /// A refused peer must have its **whole connection** closed, with
+    /// [`CLOSE_REFUSED`], before any bi-stream is served — otherwise a
+    /// rejected ticket-holder could sit on the link opening streams, each
+    /// costing a task and a `Peer` before being turned away again.
+    ///
+    /// Driven through `serve_conn` against a real QUIC connection rather
+    /// than `serve_mounted`, which waits for a relay it does not need here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refused_peer_gets_the_connection_closed() {
+        let server_ep = local_endpoint(vec![ALPN.to_vec()]).await;
+        // Direct addresses appear without a relay; wait for one rather
+        // than sleeping a fixed span.
+        let mut addr = server_ep.addr();
+        for _ in 0..200 {
+            if addr.ip_addrs().next().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            addr = server_ep.addr();
+        }
+        assert!(
+            addr.ip_addrs().next().is_some(),
+            "no direct address to dial"
+        );
+
+        let accepted = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("an incoming connection");
+            let conn = incoming.await.expect("handshake");
+            // Refuse everyone. `serve_conn` must close before `accept_bi`.
+            serve_conn(
+                conn,
+                Arc::new(|a: &IrohAccept| {
+                    assert_eq!(a.alpn(), ALPN, "the acceptor sees the negotiated ALPN");
+                    Err::<PeerHandler, _>("not on the list".to_string())
+                }),
+            )
+            .await;
+            // `close` only queues CONNECTION_CLOSE; dropping the endpoint
+            // here would end its driver before the frame goes out and the
+            // client would see an idle timeout instead of the refusal.
+            server_ep.close().await;
+        });
+
+        let client_ep = local_endpoint(Vec::new()).await;
+        let conn = client_ep.connect(addr, ALPN).await.expect("connect");
+        // Resolves when the peer closes. The timeout is only a hang guard
+        // — without it a regression that never closes would idle-time-out
+        // 30s later and report that instead.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(10), conn.closed())
+            .await
+            .expect("the peer should close promptly, not idle out");
+        let rendered = format!("{reason:?}");
+        assert!(
+            rendered.contains(&CLOSE_REFUSED.to_string()) || rendered.contains("refused"),
+            "expected the refusal close code, got: {rendered}"
+        );
+
+        accepted.await.expect("server task");
     }
 }
