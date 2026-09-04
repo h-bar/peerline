@@ -30,6 +30,32 @@ use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
+// Reserved op names
+// ---------------------------------------------------------------------------
+//
+// These are plain, un-namespaced op names — unlike the runtime's
+// `$peerline/stream.cancel`, which is prefixed precisely so it cannot
+// collide. They are part of the cross-language wire contract (the
+// TypeScript implementation and the conformance vectors both hard-code
+// them), so they cannot be renamed from this crate alone. Naming them
+// here at least gives callers a way to *avoid* the collision: an
+// application whose own op set includes `event` or `end` can compare
+// against these constants instead of duplicating the literals.
+
+/// Op name of a pubsub event push. **Occupies the application op
+/// namespace** — an app that registers its own `event` handler will
+/// shadow / be shadowed by pubsub pushes on the same peer.
+pub const EVENT_OP: &str = "event";
+
+/// Op name of the end-of-subscription push. Same namespace caveat as
+/// [`EVENT_OP`].
+pub const END_OP: &str = "end";
+
+/// Op name of the unsubscribe request. Same namespace caveat as
+/// [`EVENT_OP`].
+pub const UNSUBSCRIBE_OP: &str = "unsubscribe";
+
+// ---------------------------------------------------------------------------
 // Wire envelopes
 // ---------------------------------------------------------------------------
 
@@ -98,7 +124,7 @@ pub fn event<T: Serialize>(
         event: serde_json::to_value(payload)?,
     })?;
     Ok(Notification {
-        op: "event".to_string(),
+        op: EVENT_OP.to_string(),
         args: params_from_value(args),
     })
 }
@@ -112,7 +138,7 @@ pub fn end(subscription_id: impl Into<String>) -> Notification {
     })
     .unwrap_or(Value::Null);
     Notification {
-        op: "end".to_string(),
+        op: END_OP.to_string(),
         args: params_from_value(args),
     }
 }
@@ -147,7 +173,7 @@ impl SubscriptionIdGen {
 pub fn unsubscribe_request(id: impl Into<Id>, subscription_id: impl Into<String>) -> Request {
     peer::request(
         id,
-        "unsubscribe",
+        UNSUBSCRIBE_OP,
         &UnsubscribeParams {
             subscription_id: subscription_id.into(),
         },
@@ -181,14 +207,14 @@ pub fn classify(notif: &Notification) -> Option<PubsubMessage> {
     let args_obj = notif.args.as_ref()?;
     let args_value = Value::Object(args_obj.clone());
     match notif.op.as_str() {
-        "event" => {
+        EVENT_OP => {
             let e: EventParams = serde_json::from_value(args_value).ok()?;
             Some(PubsubMessage::Event {
                 subscription_id: e.subscription_id,
                 event: e.event,
             })
         }
-        "end" => {
+        END_OP => {
             let e: EndParams = serde_json::from_value(args_value).ok()?;
             Some(PubsubMessage::End {
                 subscription_id: e.subscription_id,

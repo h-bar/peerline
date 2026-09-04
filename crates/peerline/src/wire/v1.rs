@@ -7,10 +7,13 @@
 //! intermediate representation on every parse and, fatally, cannot
 //! capture payloads as [`serde_json::value::RawValue`] — the frame's
 //! [`Serialize`] / [`Deserialize`] are hand-written (see [`crate::wire`]).
-//! Deserialization funnels through the flat [`WireV1`] view, whose
-//! `args` / `data` fields are captured raw and only parsed at the typed
-//! boundary; [`content_from_wire`] then validates per-`kind` and builds
-//! the typed [`Content`].
+//! Deserialization funnels through the flat [`WireV1`] view, whose `data`
+//! field is captured raw and only parsed at the typed boundary;
+//! [`content_from_wire`] then validates per-`kind` and builds the typed
+//! [`Content`]. (`args` is captured raw by that view too, but the same
+//! mapping step materializes it into a [`Params`] map — the
+//! envelope's declared type — so a request payload does pay a
+//! `Value` round-trip that a response payload does not.)
 //!
 //! Wire field names are short — at most 4 chars (`op` / `args` / `data`
 //! / `err` / `seq` / `msg`) — but readable.
@@ -174,7 +177,7 @@ impl PartialEq<Value> for RawJson {
 /// field; in Rust it's the product of [`crate::wire::Frame`]'s
 /// hand-written (de)serialization, so this enum carries no serde
 /// attributes of its own.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Content {
     /// A call expecting a reply.
     Request(Request),
@@ -194,7 +197,7 @@ pub enum Content {
 /// For one-way calls, use [`Notification`] instead — they're distinct
 /// Rust types so direction-typed dispatch is enforced by the type
 /// system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     /// Caller-chosen request id — required.
     pub id: Id,
@@ -303,7 +306,7 @@ impl Response {
 /// A one-way call without an id — no reply expected, the other peer
 /// MUST NOT send one. A separate Rust type from [`Request`] so the
 /// type system enforces "Notifications don't get responses."
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Notification {
     /// The operation name.
     pub op: String,

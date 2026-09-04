@@ -62,9 +62,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// representation on every parse and cannot capture payloads as
 /// [`serde_json::value::RawValue`]. The manual impls dispatch on the
 /// tags directly and funnel deserialization through the flat
-/// [`v1::WireV1`] view, so `args` / `data` payloads are captured raw and
-/// parsed once, at the typed boundary.
-#[derive(Debug, Clone)]
+/// [`v1::WireV1`] view, so the `data` payload is captured raw and parsed
+/// once, at the typed boundary.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// v1 frame (the current and only version).
     V1(v1::Content),
