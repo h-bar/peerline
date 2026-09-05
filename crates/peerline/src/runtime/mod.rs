@@ -82,11 +82,13 @@
 //! Wasm-friendly: compiles to `wasm32-unknown-unknown` out of the
 //! box (no `tokio::spawn`, no thread-local runtime handle).
 
+mod admission;
 mod error;
 mod outbound;
 mod peer;
 mod stream;
 
+pub use admission::{Check, PeerHandler, Policy};
 pub use error::{Error, ProtocolError};
 pub use peer::{Metrics, Peer};
 pub use stream::{StreamItem, StreamReceiver, StreamSender};

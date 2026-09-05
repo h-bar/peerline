@@ -23,14 +23,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
-use peerline::runtime::Peer;
+use peerline::runtime::{Peer, Policy};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{debug, info, warn};
 
 /// A type-erased per-connection peer initializer — the closure that
-/// registers a service's handlers, after boxing.
-pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
+/// registers a service's handlers, after boxing. Defined in
+/// [`peerline::runtime`], re-exported here so transport users need only
+/// this crate.
+pub use peerline::runtime::PeerHandler;
 
 // ---------------------------------------------------------------------------
 // UdsAccept — the connection's facts
@@ -91,20 +93,12 @@ pub type Acceptor = Arc<dyn Fn(&UdsAccept) -> Result<PeerHandler, String> + Send
 // UdsPolicy — the common decisions, as a value
 // ---------------------------------------------------------------------------
 
-type CustomCheck = Arc<dyn Fn(&UdsAccept) -> Result<(), String> + Send + Sync + 'static>;
-
+/// A reusable admission policy — a conjunction of checks over
+/// [`UdsAccept`], backed by [`peerline::runtime::Policy`] so `custom`,
+/// `and`, `check`, and `acceptor` behave identically across transports.
+/// A value rather than a closure, so a mount table can carry it.
 #[derive(Clone)]
-enum Rule {
-    AllowAny,
-    SameUser,
-    Users(Arc<[u32]>),
-    Custom(CustomCheck),
-}
-
-/// A reusable admission policy. A value rather than a closure, so a mount
-/// table can carry it.
-#[derive(Clone)]
-pub struct UdsPolicy(Rule);
+pub struct UdsPolicy(Policy<UdsAccept>);
 
 impl Default for UdsPolicy {
     fn default() -> Self {
@@ -122,52 +116,63 @@ impl UdsPolicy {
     /// catches the case where it was not.
     #[must_use]
     pub fn same_user() -> Self {
-        Self(Rule::SameUser)
+        Self(Policy::custom(|accept: &UdsAccept| {
+            let me = rustix::process::geteuid().as_raw();
+            if accept.uid() == me || accept.uid() == 0 {
+                Ok(())
+            } else {
+                Err(format!("uid {} is not {me} or root", accept.uid()))
+            }
+        }))
     }
 
     /// Admit connections from any of `uids`.
     #[must_use]
     pub fn users<I: IntoIterator<Item = u32>>(uids: I) -> Self {
-        Self(Rule::Users(uids.into_iter().collect()))
+        let uids: Vec<u32> = uids.into_iter().collect();
+        Self(Policy::custom(move |accept: &UdsAccept| {
+            if uids.contains(&accept.uid()) {
+                Ok(())
+            } else {
+                Err(format!("uid {} not permitted", accept.uid()))
+            }
+        }))
     }
 
-    /// Admit every connection, relying on the socket's file permissions
-    /// alone.
+    /// Admit every connection whose credentials the kernel can report,
+    /// relying on the socket's file permissions alone. (Screening reads
+    /// peer credentials before any policy runs, and a connection whose
+    /// credentials cannot be read is refused rather than served blind —
+    /// which essentially cannot happen for a connected stream on the
+    /// supported platforms.)
     #[must_use]
     pub fn allow_any() -> Self {
-        Self(Rule::AllowAny)
+        Self(Policy::allow_any())
     }
 
-    /// Decide with `f`.
+    /// A policy that is only `f`.
     #[must_use]
     pub fn custom<F>(f: F) -> Self
     where
         F: Fn(&UdsAccept) -> Result<(), String> + Send + Sync + 'static,
     {
-        Self(Rule::Custom(Arc::new(f)))
+        Self(Policy::custom(f))
+    }
+
+    /// Additionally require `f` to accept. Composes: every `and` is kept
+    /// and all must pass — e.g. `UdsPolicy::same_user().and(...)` keeps
+    /// the euid rule *and* enforces the extra check.
+    #[must_use]
+    pub fn and<F>(self, f: F) -> Self
+    where
+        F: Fn(&UdsAccept) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self(self.0.and(f))
     }
 
     /// Apply the policy. `Err(reason)` refuses the connection.
     pub fn check(&self, accept: &UdsAccept) -> Result<(), String> {
-        match &self.0 {
-            Rule::AllowAny => Ok(()),
-            Rule::SameUser => {
-                let me = rustix::process::geteuid().as_raw();
-                if accept.uid() == me || accept.uid() == 0 {
-                    Ok(())
-                } else {
-                    Err(format!("uid {} is not {me} or root", accept.uid()))
-                }
-            }
-            Rule::Users(uids) => {
-                if uids.contains(&accept.uid()) {
-                    Ok(())
-                } else {
-                    Err(format!("uid {} not permitted", accept.uid()))
-                }
-            }
-            Rule::Custom(f) => f(accept),
-        }
+        self.0.check(accept)
     }
 
     /// Pair this policy with a peer initializer, giving the closure
@@ -179,11 +184,7 @@ impl UdsPolicy {
     where
         F: Fn(&Peer) + Send + Sync + 'static,
     {
-        let on_peer: PeerHandler = Arc::new(on_peer);
-        move |accept: &UdsAccept| {
-            self.check(accept)?;
-            Ok(on_peer.clone())
-        }
+        self.0.acceptor(on_peer)
     }
 }
 
@@ -212,7 +213,9 @@ where
 /// client reaches one service by connecting to that socket. Unlike WS
 /// (paths on one port) or iroh (ALPNs on one endpoint), a UDS mount is a
 /// distinct socket file — the filesystem is the namespace. All listeners
-/// run concurrently; the call returns if any one fails to bind or accept.
+/// run concurrently; the call returns if any one fails to bind. Per-accept
+/// errors do not tear a listener down: they are logged and retried after a
+/// short pause.
 ///
 /// Each socket is published owner-only (`0600` on unix): it is bound and
 /// `chmod`ed under a staging name in the same directory and then renamed
@@ -283,8 +286,10 @@ fn staging_path(path: &Path) -> PathBuf {
 /// control.
 ///
 /// Closing the umask window completely would need the bind to happen
-/// under a private `0700` directory or a scoped umask, neither of which
-/// this crate can do without `unsafe` or a new dependency. A caller that
+/// under a private `0700` directory (creatable safely via rustix's `fs`
+/// API — a mode-explicit `mkdir`, an `O_NOFOLLOW` ownership check, then
+/// rename out) — machinery this crate deliberately doesn't carry for a
+/// window that is only reachable under a permissive umask. A caller that
 /// wants the stronger guarantee should place the socket in a directory
 /// only it can write.
 async fn bind_owner_only(path: &Path) -> Result<UnixListener, String> {
@@ -360,21 +365,87 @@ async fn ensure_staging_is_not_a_symlink(staging: &Path) -> Result<(), String> {
     }
 }
 
+/// Best-effort removal of staging leftovers from previous runs that died
+/// between `bind` and `rename`: siblings of `path` named
+/// `<name>.<pid>.<seq>.tmp` whose pid no longer names a live process.
+/// Nothing else ever removes these — a fresh run computes a different
+/// pid/seq name — so without the sweep a crash-looping daemon accumulates
+/// dead staging sockets forever. Entries whose pid is alive are left
+/// alone: they may belong to a concurrent publisher of this same target
+/// (or another listener in this process). Failures are ignored — the
+/// sweep is hygiene, and the staging name this bind actually uses is
+/// cleared separately with a hard error.
+async fn sweep_stale_staging(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let Some(stem) = file_name
+            .to_str()
+            .and_then(|f| f.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        // The stem must be exactly `<pid>.<seq>` — anything else is not
+        // ours to judge.
+        let mut parts = stem.split('.');
+        let (Some(pid), Some(seq), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if seq.parse::<u64>().is_err() {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+}
+
+/// `kill(pid, 0)` via rustix. Only ESRCH proves the pid is free; success
+/// or EPERM means some process holds it, so its staging entries are
+/// treated as live.
+fn pid_is_alive(pid: i32) -> bool {
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        // Zero / negative — not a pid the staging scheme writes.
+        return true;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
 /// One UDS listener: publish `path` owner-only, then accept forever,
 /// screening each connection with `acceptor`. The shared core behind both
 /// [`serve`] and [`serve_mounted`].
 async fn serve_one(path: PathBuf, acceptor: Acceptor) -> Result<(), String> {
+    sweep_stale_staging(&path).await;
     let listener = bind_owner_only(&path).await?;
     info!(socket = %path.display(), "peerline-uds listening");
 
     loop {
         // A per-accept error (e.g. the process is momentarily out of file
         // descriptors) must not tear the whole listener down — log it and
-        // keep serving, matching the iroh/ws acceptors' resilience.
+        // keep serving, matching the iroh/ws acceptors' resilience. The
+        // pause is for the sticky case: under EMFILE the pending
+        // connection keeps the listener readable and `accept` fails again
+        // immediately, so an unpaced retry pegs a core and floods the log.
         let (stream, _addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 warn!(error = %e, "peerline-uds accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -536,6 +607,42 @@ mod tests {
         restore(&dir);
     }
 
+    /// The sweep removes only what it can prove stale: a staging entry
+    /// whose pid is dead. Entries with a live pid (possibly a concurrent
+    /// publisher) and names that don't match the `<pid>.<seq>.tmp` shape
+    /// are left alone.
+    #[tokio::test]
+    async fn sweep_removes_only_dead_pid_staging_entries() {
+        let dir = temp_socket("sweep-dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("app.sock");
+
+        // A pid that provably no longer runs: spawn something short-lived
+        // and reap it.
+        let dead_pid = {
+            let mut child = std::process::Command::new("/usr/bin/true")
+                .spawn()
+                .expect("spawn");
+            let pid = child.id();
+            child.wait().expect("wait");
+            pid
+        };
+
+        let stale = dir.join(format!("app.sock.{dead_pid}.0.tmp"));
+        let live = dir.join(format!("app.sock.{}.1.tmp", std::process::id()));
+        let unrelated = dir.join("app.sock.notapid.2.tmp");
+        for f in [&stale, &live, &unrelated] {
+            std::fs::write(f, b"").expect("plant entry");
+        }
+
+        sweep_stale_staging(&target).await;
+
+        assert!(!stale.exists(), "dead-pid entry must be swept");
+        assert!(live.exists(), "live-pid entry must survive");
+        assert!(unrelated.exists(), "non-matching name must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The second guard, for a squatter that appears *after* the removal
     /// and before the bind. `bind` follows a trailing symlink, so the
     /// staging entry surviving as a symlink means the socket landed
@@ -586,6 +693,40 @@ mod tests {
         assert!(p.check(&accept_as(501)).is_ok());
         assert!(p.check(&accept_as(503)).is_err());
         assert!(UdsPolicy::allow_any().check(&accept_as(999)).is_ok());
+    }
+
+    /// `and` composes with the named rules — the point of the shared
+    /// policy machinery: `same_user()` gains an extra conjunct without
+    /// re-implementing the euid-or-root rule.
+    #[test]
+    fn policy_and_composes_with_named_rules() {
+        let me = rustix::process::geteuid().as_raw();
+        let p = UdsPolicy::same_user().and(|a: &UdsAccept| {
+            if a.pid().is_some() {
+                Ok(())
+            } else {
+                Err("no pid".into())
+            }
+        });
+        let with_pid = UdsAccept {
+            uid: me,
+            gid: 0,
+            pid: Some(1),
+        };
+        let without_pid = UdsAccept {
+            uid: me,
+            gid: 0,
+            pid: None,
+        };
+        assert!(p.check(&with_pid).is_ok());
+        assert_eq!(p.check(&without_pid).unwrap_err(), "no pid");
+        // The named rule is still enforced alongside the conjunct.
+        let other_user = UdsAccept {
+            uid: me.wrapping_add(1),
+            gid: 0,
+            pid: Some(1),
+        };
+        assert!(p.check(&other_user).is_err());
     }
 
     /// A refused connection reaches no op: the client's call fails rather

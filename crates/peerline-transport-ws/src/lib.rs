@@ -37,12 +37,12 @@ use axum::routing::get;
 use futures::future::BoxFuture;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use peerline::runtime::Peer;
+use peerline::runtime::{Peer, Policy};
 use tracing::{info, warn};
 
 /// A type-erased per-connection peer initializer — the closure that
 /// registers a service's handlers, after boxing.
-pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
+pub use peerline::runtime::PeerHandler;
 
 // ---------------------------------------------------------------------------
 // WsAccept — the handshake's facts
@@ -201,19 +201,18 @@ pub type Acceptor = Arc<dyn Fn(&WsAccept) -> Result<WsAdmit, String> + Send + Sy
 // WsPolicy — the common decisions, as a value
 // ---------------------------------------------------------------------------
 
-type CustomCheck = Arc<dyn Fn(&WsAccept) -> Result<(), String> + Send + Sync + 'static>;
-
 /// A reusable admission policy — the common cases spelled out, so callers
-/// need not hand-roll a closure for each. A value rather than a closure,
-/// so a mount table can carry it.
-#[derive(Clone, Default)]
-pub struct WsPolicy {
-    origins: Option<Arc<[String]>>,
-    loopback_only: bool,
-    /// Every check must pass. A list, not one slot: a policy that silently
-    /// dropped an earlier `and` would be weaker than it reads, which is
-    /// the failure this whole type exists to prevent.
-    custom: Vec<CustomCheck>,
+/// need not hand-roll a closure for each. A conjunction of checks over
+/// [`WsAccept`], backed by [`peerline::runtime::Policy`] so `custom`,
+/// `and`, and `check` behave identically across transports. A value
+/// rather than a closure, so a mount table can carry it.
+#[derive(Clone)]
+pub struct WsPolicy(Policy<WsAccept>);
+
+impl Default for WsPolicy {
+    fn default() -> Self {
+        Self::allow_any()
+    }
 }
 
 impl WsPolicy {
@@ -221,7 +220,7 @@ impl WsPolicy {
     /// existed, now stated at the call site instead of assumed.
     #[must_use]
     pub fn allow_any() -> Self {
-        Self::default()
+        Self(Policy::allow_any())
     }
 
     /// Admit a handshake whose `Origin` matches one of `origins` exactly
@@ -244,28 +243,41 @@ impl WsPolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self {
-            origins: Some(origins.into_iter().map(Into::into).collect()),
-            ..Self::default()
-        }
+        let origins: Vec<String> = origins.into_iter().map(Into::into).collect();
+        Self(Policy::custom(move |accept: &WsAccept| {
+            if let Some(origin) = accept.origin()
+                && !origins.iter().any(|a| a == origin)
+            {
+                return Err(format!("origin not permitted: {origin}"));
+            }
+            Ok(())
+        }))
     }
 
     /// Additionally require the client's address to be loopback.
     #[must_use]
-    pub fn loopback_only(mut self) -> Self {
-        self.loopback_only = true;
-        self
+    pub fn loopback_only(self) -> Self {
+        self.and(|accept: &WsAccept| {
+            // `to_canonical` first: a dual-stack bind (`[::]`, v6only
+            // off) reports an IPv4 client as an IPv4-mapped IPv6
+            // address (`::ffff:127.0.0.1`), which `is_loopback` alone
+            // would refuse.
+            if accept.remote_addr().ip().to_canonical().is_loopback() {
+                Ok(())
+            } else {
+                Err(format!("not loopback: {}", accept.remote_addr()))
+            }
+        })
     }
 
     /// Additionally require `f` to accept. Composes: every `and` is kept
     /// and all must pass.
     #[must_use]
-    pub fn and<F>(mut self, f: F) -> Self
+    pub fn and<F>(self, f: F) -> Self
     where
         F: Fn(&WsAccept) -> Result<(), String> + Send + Sync + 'static,
     {
-        self.custom.push(Arc::new(f));
-        self
+        Self(self.0.and(f))
     }
 
     /// A policy that is only `f`.
@@ -274,29 +286,19 @@ impl WsPolicy {
     where
         F: Fn(&WsAccept) -> Result<(), String> + Send + Sync + 'static,
     {
-        Self::default().and(f)
+        Self(Policy::custom(f))
     }
 
     /// Apply the policy. `Err(reason)` refuses the handshake.
     pub fn check(&self, accept: &WsAccept) -> Result<(), String> {
-        if let Some(allowed) = &self.origins
-            && let Some(origin) = accept.origin()
-            && !allowed.iter().any(|a| a == origin)
-        {
-            return Err(format!("origin not permitted: {origin}"));
-        }
-        if self.loopback_only && !accept.remote_addr().ip().is_loopback() {
-            return Err(format!("not loopback: {}", accept.remote_addr()));
-        }
-        for custom in &self.custom {
-            custom(accept)?;
-        }
-        Ok(())
+        self.0.check(accept)
     }
 
     /// Pair this policy with a peer initializer, giving the closure
     /// [`serve`] wants when the policy is all the screening needed.
-    /// Wrap in [`Arc`] for a [`serve_mounted`] table.
+    /// Wrap in [`Arc`] for a [`serve_mounted`] table. Not delegated to
+    /// [`Policy::acceptor`]: a ws admission carries a [`WsAdmit`] (the
+    /// initializer plus an optional subprotocol), not a bare handler.
     pub fn acceptor<F>(
         self,
         on_peer: F,
@@ -306,7 +308,7 @@ impl WsPolicy {
     {
         let on_peer: PeerHandler = Arc::new(on_peer);
         move |accept: &WsAccept| {
-            self.check(accept)?;
+            self.0.check(accept)?;
             Ok(WsAdmit::from(on_peer.clone()))
         }
     }
@@ -432,18 +434,66 @@ async fn serve_conn(socket: WebSocket, init: PeerHandler) {
 }
 
 // ---------------------------------------------------------------------------
-// Dial side — unchanged
+// Dial side
 // ---------------------------------------------------------------------------
+
+/// Why [`connect`] failed — typed so a dialer can tell "the server's
+/// policy refused me" from "the network broke" without matching error
+/// strings, and react accordingly (surface "not allowed", start an
+/// authorization flow) instead of blindly retrying.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The server answered the handshake with **403** instead of
+    /// upgrading — the acceptor's refusal, exactly as [`serve`] sends it.
+    Refused,
+    /// Anything else — DNS, TCP, TLS, a non-403 HTTP answer (e.g. 404
+    /// for a wrong mount path), or a malformed WebSocket exchange —
+    /// rendered as the string `connect` used to return.
+    Other(String),
+}
+
+impl ConnectError {
+    fn classify(url: &str, e: &tokio_tungstenite::tungstenite::Error) -> Self {
+        match e {
+            tokio_tungstenite::tungstenite::Error::Http(resp)
+                if resp.status() == StatusCode::FORBIDDEN =>
+            {
+                Self::Refused
+            }
+            e => Self::Other(format!("ws connect {url}: {e}")),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => f.write_str("ws connect refused (HTTP 403)"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+/// Keeps `?` working in callers that return `Result<_, String>` — the
+/// error type [`connect`] had before refusals became typed.
+impl From<ConnectError> for String {
+    fn from(e: ConnectError) -> Self {
+        e.to_string()
+    }
+}
 
 /// Dial a peerline endpoint at `url` (`ws://host:port` or `wss://…`, the
 /// dial side of [`serve`]) and return one `(Peer, driver)`. Register
 /// handlers on the peer, then drive `driver` to run the session; it
-/// resolves when the socket closes.
+/// resolves when the socket closes. A refused handshake surfaces as
+/// [`ConnectError::Refused`].
 ///
 /// A single frame is capped at [`peerline::MAX_FRAME_LEN`], matching the
 /// accept side. Uses `tokio-tungstenite`, so no axum types are involved
 /// on the dial path.
-pub async fn connect(url: &str) -> Result<(Peer, BoxFuture<'static, ()>), String> {
+pub async fn connect(url: &str) -> Result<(Peer, BoxFuture<'static, ()>), ConnectError> {
     use tokio_tungstenite::tungstenite::Message as TMessage;
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -454,7 +504,7 @@ pub async fn connect(url: &str) -> Result<(Peer, BoxFuture<'static, ()>), String
         .max_frame_size(Some(peerline::MAX_FRAME_LEN));
     let (ws, _resp) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
         .await
-        .map_err(|e| format!("ws connect {url}: {e}"))?;
+        .map_err(|e| ConnectError::classify(url, &e))?;
     info!(url, "peerline-ws dialed");
 
     let (ws_sink, ws_stream) = ws.split();
@@ -583,6 +633,20 @@ mod tests {
         assert!(err.contains("loopback"), "unexpected: {err}");
     }
 
+    /// A dual-stack bind (`[::]`, v6only off) reports IPv4 clients as
+    /// IPv4-mapped IPv6 addresses — those must count as loopback (or not)
+    /// by what they map to, not be refused wholesale.
+    #[test]
+    fn loopback_only_canonicalizes_mapped_addresses() {
+        let p = WsPolicy::allow_any().loopback_only();
+        assert!(p.check(&accept_with(None, "[::ffff:127.0.0.1]:1")).is_ok());
+        assert!(p.check(&accept_with(None, "[::1]:1")).is_ok());
+        assert!(
+            p.check(&accept_with(None, "[::ffff:192.168.1.9]:1"))
+                .is_err()
+        );
+    }
+
     /// End to end: a refused handshake gets **403 and no upgrade**, so the
     /// client never reaches an op. The status is the point — a post-upgrade
     /// refusal would look to the client like a crash.
@@ -636,5 +700,42 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// The dial side of the refusal: [`connect`] surfaces the 403 as
+    /// [`ConnectError::Refused`], so a client reacts to policy — not to
+    /// substrings of an error message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refused_connect_yields_typed_refusal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let server = tokio::spawn(async move {
+            serve(
+                addr,
+                WsPolicy::custom(|_: &WsAccept| Err("nobody today".into()))
+                    .acceptor(|_: &Peer| {}),
+            )
+            .await
+        });
+
+        let url = format!("ws://{addr}");
+        // Retry while nothing is listening yet: a refusal is an HTTP
+        // answer, so any Other error here is just the race with bind.
+        for _ in 0..200 {
+            match connect(&url).await {
+                Err(ConnectError::Refused) => {
+                    server.abort();
+                    return;
+                }
+                Err(ConnectError::Other(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) => panic!("the refuse-all policy must not admit"),
+            }
+        }
+        panic!("server never refused the handshake");
     }
 }

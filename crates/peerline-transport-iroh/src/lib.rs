@@ -39,7 +39,7 @@ use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode};
-use peerline::runtime::Peer;
+use peerline::runtime::{Peer, Policy};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
@@ -72,8 +72,10 @@ pub fn decode_ticket(ticket: &str) -> Result<EndpointAddr, String> {
 }
 
 /// A type-erased per-connection peer initializer — the closure that
-/// registers a service's handlers, after boxing.
-pub type PeerHandler = Arc<dyn Fn(&Peer) + Send + Sync + 'static>;
+/// registers a service's handlers, after boxing. Defined in
+/// [`peerline::runtime`], re-exported here so transport users need only
+/// this crate.
+pub use peerline::runtime::PeerHandler;
 
 // ---------------------------------------------------------------------------
 // IrohAccept — the connection's facts
@@ -112,10 +114,10 @@ impl IrohAccept {
 
 /// QUIC application close code sent when an [`Acceptor`] refuses a peer.
 ///
-/// A dialer holding the raw [`Connection`] can read it from the close
-/// reason and tell refusal from a transport failure. [`connect`] does not
-/// surface it structurally — it renders connection failures as strings —
-/// so matching on it means driving the endpoint yourself.
+/// [`connect`] surfaces it structurally as [`ConnectError::Refused`]; a
+/// dialer driving the endpoint itself can read it from the close reason
+/// of the raw [`Connection`] and tell refusal from a transport failure
+/// the same way.
 pub const CLOSE_REFUSED: u32 = 4403;
 
 /// Screens one connection: given its [`IrohAccept`] facts, either admit it
@@ -133,25 +135,25 @@ pub type Acceptor = Arc<dyn Fn(&IrohAccept) -> Result<PeerHandler, String> + Sen
 // IrohPolicy — the common decisions, as a value
 // ---------------------------------------------------------------------------
 
-type CustomCheck = Arc<dyn Fn(&IrohAccept) -> Result<(), String> + Send + Sync + 'static>;
-
+/// A reusable admission policy — a conjunction of checks over
+/// [`IrohAccept`], backed by [`peerline::runtime::Policy`] so `custom`,
+/// `and`, `check`, and `acceptor` behave identically across transports.
+/// A value rather than a closure, so a mount table can carry it.
 #[derive(Clone)]
-enum Rule {
-    AnyTicketHolder,
-    Endpoints(Arc<[EndpointId]>),
-    Custom(CustomCheck),
-}
-
-/// A reusable admission policy. A value rather than a closure, so a mount
-/// table can carry it.
-#[derive(Clone)]
-pub struct IrohPolicy(Rule);
+pub struct IrohPolicy(Policy<IrohAccept>);
 
 impl IrohPolicy {
     /// Admit only these endpoint ids.
     #[must_use]
     pub fn endpoints<I: IntoIterator<Item = EndpointId>>(ids: I) -> Self {
-        Self(Rule::Endpoints(ids.into_iter().collect()))
+        let ids: Vec<EndpointId> = ids.into_iter().collect();
+        Self(Policy::custom(move |accept: &IrohAccept| {
+            if ids.contains(&accept.remote_id()) {
+                Ok(())
+            } else {
+                Err(format!("endpoint {} not permitted", accept.remote_id()))
+            }
+        }))
     }
 
     /// Admit anyone who can reach the endpoint on a mounted ALPN.
@@ -162,32 +164,34 @@ impl IrohPolicy {
     /// when the service exposes nothing worth protecting.
     #[must_use]
     pub fn any_ticket_holder() -> Self {
-        Self(Rule::AnyTicketHolder)
+        Self(Policy::allow_any())
     }
 
-    /// Decide with `f` — the seam for a dynamic allowlist, e.g. one behind
-    /// an `Arc<RwLock<HashSet<EndpointId>>>` that a pairing flow updates.
+    /// A policy that is only `f` — the seam for a dynamic allowlist, e.g.
+    /// one behind an `Arc<RwLock<HashSet<EndpointId>>>` that a pairing
+    /// flow updates.
     #[must_use]
     pub fn custom<F>(f: F) -> Self
     where
         F: Fn(&IrohAccept) -> Result<(), String> + Send + Sync + 'static,
     {
-        Self(Rule::Custom(Arc::new(f)))
+        Self(Policy::custom(f))
+    }
+
+    /// Additionally require `f` to accept. Composes: every `and` is kept
+    /// and all must pass — e.g. `IrohPolicy::endpoints(...).and(...)`
+    /// keeps the allowlist *and* enforces the extra check.
+    #[must_use]
+    pub fn and<F>(self, f: F) -> Self
+    where
+        F: Fn(&IrohAccept) -> Result<(), String> + Send + Sync + 'static,
+    {
+        Self(self.0.and(f))
     }
 
     /// Apply the policy. `Err(reason)` refuses the connection.
     pub fn check(&self, accept: &IrohAccept) -> Result<(), String> {
-        match &self.0 {
-            Rule::AnyTicketHolder => Ok(()),
-            Rule::Endpoints(ids) => {
-                if ids.contains(&accept.remote_id()) {
-                    Ok(())
-                } else {
-                    Err(format!("endpoint {} not permitted", accept.remote_id()))
-                }
-            }
-            Rule::Custom(f) => f(accept),
-        }
+        self.0.check(accept)
     }
 
     /// Pair this policy with a peer initializer, giving the closure
@@ -199,11 +203,7 @@ impl IrohPolicy {
     where
         F: Fn(&Peer) + Send + Sync + 'static,
     {
-        let on_peer: PeerHandler = Arc::new(on_peer);
-        move |accept: &IrohAccept| {
-            self.check(accept)?;
-            Ok(on_peer.clone())
-        }
+        self.0.acceptor(on_peer)
     }
 }
 
@@ -628,6 +628,53 @@ pub async fn dial_plan(
     Ok((endpoint, peer))
 }
 
+/// Why [`connect`] failed — typed so a dialer can tell "the server's
+/// policy refused me" from "the network broke" without matching error
+/// strings. The seam a pairing flow needs: on [`ConnectError::Refused`],
+/// start pairing; on [`ConnectError::Other`], back off and retry.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The server's acceptor refused this endpoint: the QUIC connection
+    /// was closed with [`CLOSE_REFUSED`] before any bi-stream was
+    /// served.
+    Refused,
+    /// Anything else — a bad ticket, no route, a handshake failure, or a
+    /// connection loss that isn't the refusal close — rendered as the
+    /// string `connect` used to return.
+    Other(String),
+}
+
+impl ConnectError {
+    fn classify(context: &str, e: &iroh::endpoint::ConnectionError) -> Self {
+        if let iroh::endpoint::ConnectionError::ApplicationClosed(close) = e
+            && close.error_code == CLOSE_REFUSED.into()
+        {
+            Self::Refused
+        } else {
+            Self::Other(format!("{context}: {e}"))
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => f.write_str("iroh connect refused (admission policy)"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+/// Keeps `?` working in callers that return `Result<_, String>` — the
+/// error type [`connect`] had before refusals became typed.
+impl From<ConnectError> for String {
+    fn from(e: ConnectError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Dial the peerline endpoint named by `ticket` for `alpn` (the dial side
 /// of [`serve`]) and return one `(Peer, driver)`. Binds a fresh dialing
 /// endpoint shaped by `mode` (see [`DialMode`]), connects over the filtered
@@ -649,23 +696,36 @@ pub async fn dial_plan(
 /// peer reaches us back, so we bind our own endpoint to that same relay. In
 /// `Auto`, a ticket with no relay falls back to the n0 defaults; the pinned
 /// modes instead refuse a ticket that can't support the pin.
+///
+/// A server-side admission refusal surfaces as [`ConnectError::Refused`]
+/// when its close arrives before the bi-stream opens (the ordinary case —
+/// the server closes immediately after the handshake). A refusal racing
+/// past that window surfaces as the returned driver ending, like any
+/// other connection loss.
 pub async fn connect(
     ticket: &str,
     alpn: &[u8],
     mode: DialMode,
-) -> Result<(Peer, BoxFuture<'static, ()>), String> {
-    let addr = decode_ticket(ticket)?;
-    let (endpoint, peer_addr) = dial_plan(&addr, mode).await?;
+) -> Result<(Peer, BoxFuture<'static, ()>), ConnectError> {
+    let addr = decode_ticket(ticket).map_err(ConnectError::Other)?;
+    let (endpoint, peer_addr) = dial_plan(&addr, mode)
+        .await
+        .map_err(ConnectError::Other)?;
+    // A handshake failure is never a refusal: the acceptor only runs
+    // once the handshake has fixed the dialer's identity and ALPN.
     let conn = endpoint
         .connect(peer_addr, alpn)
         .await
-        .map_err(|e| format!("iroh connect: {e}"))?;
+        .map_err(|e| ConnectError::Other(format!("iroh connect: {e}")))?;
     // `accept_bi` on the far side only resolves once we send data;
     // peerline's first client frame does that, so no priming write.
+    // A refusal lands here: the server closes the whole connection with
+    // CLOSE_REFUSED right after the handshake, so by the time the
+    // stream is opened the close has (all but pathologically) arrived.
     let (send, recv) = conn
         .open_bi()
         .await
-        .map_err(|e| format!("iroh open_bi: {e}"))?;
+        .map_err(|e| ConnectError::classify("iroh open_bi", &e))?;
     info!(remote = %conn.remote_id(), "peerline-iroh dialed");
 
     let (sink, stream) = text_frames(tokio::io::join(recv, send));
@@ -800,7 +860,10 @@ mod tests {
             Ok(_) => panic!("foreign ticket should not connect"),
             Err(e) => e,
         };
-        assert!(err.contains(TICKET_PREFIX), "unexpected error: {err}");
+        assert!(
+            matches!(&err, ConnectError::Other(msg) if msg.contains(TICKET_PREFIX)),
+            "unexpected error: {err}"
+        );
     }
 }
 
@@ -834,6 +897,27 @@ mod admission_tests {
                 .check(&accept_from(other))
                 .is_ok()
         );
+    }
+
+    /// `and` composes with the named rules — an allowlist gains an extra
+    /// conjunct (here: pinning the ALPN) without re-implementing it.
+    #[test]
+    fn policy_and_composes_with_named_rules() {
+        let allowed = SecretKey::generate().public();
+        let p = IrohPolicy::endpoints([allowed]).and(|a: &IrohAccept| {
+            if a.alpn() == b"test/1" {
+                Ok(())
+            } else {
+                Err("wrong alpn".into())
+            }
+        });
+        assert!(p.check(&accept_from(allowed)).is_ok());
+        let mut wrong_alpn = accept_from(allowed);
+        wrong_alpn.alpn = b"other/1".to_vec();
+        assert_eq!(p.check(&wrong_alpn).unwrap_err(), "wrong alpn");
+        // The named rule is still enforced alongside the conjunct.
+        let other = SecretKey::generate().public();
+        assert!(p.check(&accept_from(other)).is_err());
     }
 
     /// A dynamic allowlist needs no dedicated API — `custom` over shared
