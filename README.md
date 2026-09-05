@@ -1,5 +1,10 @@
 # peerline
 
+[![CI](https://github.com/h-bar/peerline/actions/workflows/ci.yml/badge.svg)](https://github.com/h-bar/peerline/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/peerline.svg)](https://crates.io/crates/peerline)
+[![docs.rs](https://img.shields.io/docsrs/peerline)](https://docs.rs/peerline)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Peer-symmetric bidirectional RPC: requests, notifications, correlated streams
 and a pubsub layer over a small versioned JSON wire format.
 
@@ -37,8 +42,17 @@ notification, not a frame kind.
 
 ## Quick start
 
+```sh
+cargo add peerline --features runtime   # wire types + the stateful Peer
+cargo add peerline-transport-ws         # or -uds / -iroh
+```
+
+Every transport's `connect` yields the same pair — a `Peer` and a driver
+future that runs the session and resolves when the connection closes:
+
 ```rust
-use peerline::runtime::Peer;
+let (peer, driver) = peerline_transport_ws::connect("ws://127.0.0.1:8080/").await?;
+tokio::spawn(driver);
 
 let sum: i64 = peer.call("add", &Args { a: 1, b: 2 }).await?;
 peer.notify("log", &Line { line: "started" })?;
