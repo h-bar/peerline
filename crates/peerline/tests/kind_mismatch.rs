@@ -162,6 +162,44 @@ async fn call_on_stream_handler_fails_the_waiter() {
     }
 }
 
+/// Failing the unary waiter also cancels the stream upstream, exactly
+/// as a dropped `StreamReceiver` would: the producer doesn't know its
+/// reply shape lost, and without the cancel a long-lived handler would
+/// keep streaming (each frame reported unroutable) for the rest of the
+/// connection.
+#[tokio::test]
+async fn call_on_stream_handler_cancels_the_producer() {
+    let (client, server, driver) = loopback();
+    tokio::spawn(driver);
+
+    let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancelled_tx = std::sync::Mutex::new(Some(cancelled_tx));
+    server.on_stream_request("streamy", move |_: serde_json::Value, sender| {
+        let tx = cancelled_tx.lock().unwrap().take();
+        async move {
+            sender.send_item(&1).ok();
+            sender.cancelled().await;
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+            Ok::<_, RpcError>(())
+        }
+    });
+
+    let got = tokio::time::timeout(
+        GUARD,
+        client.call::<_, serde_json::Value>("streamy", &json!({})),
+    )
+    .await
+    .expect("call must not hang");
+    assert!(got.is_err(), "the unary waiter must fail");
+
+    tokio::time::timeout(GUARD, cancelled_rx)
+        .await
+        .expect("producer must observe the cancel")
+        .expect("producer must signal before the connection ends");
+}
+
 /// When the stream handler fails, its error is the informative one and
 /// is forwarded to the unary waiter verbatim.
 #[tokio::test]
@@ -370,4 +408,79 @@ async fn duplicate_unary_reply_does_not_yield_a_second_error() {
         ProtocolError::UnroutableFrame { id: reported } => assert_eq!(reported, id),
         other => panic!("unexpected report: {other:?}"),
     }
+}
+
+/// The narrower window of the same contract: the stream's *real* error
+/// terminal is already queued (but not yet polled — the registry entry
+/// only clears at poll time) when a stray unary reply arrives for the
+/// same id. The stray reply finds the entry and injects a second error
+/// terminal behind the first; the receiver must still yield exactly one
+/// `Err` — it is fused on the first terminal it delivers.
+#[tokio::test]
+async fn stray_reply_behind_a_queued_terminal_does_not_yield_a_second_error() {
+    use futures::channel::mpsc;
+    use futures::sink::SinkExt;
+    use peerline::runtime::Peer;
+    use std::convert::Infallible;
+
+    let (mut in_tx, in_rx) = mpsc::unbounded::<Result<String, Infallible>>();
+    let (out_tx, mut out_rx) = mpsc::unbounded::<String>();
+    let (peer, driver) = Peer::new(out_tx, in_rx);
+
+    let (seen_tx, mut seen_rx) = mpsc::unbounded::<ProtocolError>();
+    peer.on_protocol_error(move |e| {
+        let _ = seen_tx.unbounded_send(e);
+    });
+    tokio::spawn(driver);
+
+    let mut rx = peer
+        .call_stream::<_, serde_json::Value>("streamy", &json!({}))
+        .expect("call_stream");
+    let sent = tokio::time::timeout(GUARD, out_rx.next())
+        .await
+        .expect("request must be written")
+        .expect("request must be written");
+    let id = serde_json::from_str::<serde_json::Value>(&sent).expect("json")["id"]
+        .as_u64()
+        .expect("id");
+
+    // Real error terminal, then the stray unary reply for the same id —
+    // dispatched before the receiver polls anything.
+    let terminal = format!(
+        r#"{{"ver":"1","kind":"stream","id":{id},"seq":-1,"err":{{"code":-32000,"msg":"boom"}}}}"#
+    );
+    in_tx.send(Ok(terminal)).await.expect("send");
+    let stray = format!(r#"{{"ver":"1","kind":"resp","id":{id},"data":1}}"#);
+    in_tx.send(Ok(stray)).await.expect("send");
+    // Sequencing marker: dispatch is in-order, so once this unroutable
+    // frame is reported, both frames above have been dispatched.
+    in_tx
+        .send(Ok(r#"{"ver":"1","kind":"resp","id":999999,"data":1}"#.into()))
+        .await
+        .expect("send");
+    match tokio::time::timeout(GUARD, seen_rx.next())
+        .await
+        .expect("hook must fire")
+        .expect("hook must fire")
+    {
+        ProtocolError::UnroutableFrame { id: reported } => assert_eq!(reported, 999_999),
+        other => panic!("unexpected report: {other:?}"),
+    }
+
+    // Exactly one error — the real terminal's — then end of stream.
+    match tokio::time::timeout(GUARD, rx.next())
+        .await
+        .expect("no hang")
+        .expect("the terminal must be delivered")
+    {
+        Err(Error::Rpc(e)) => assert_eq!(e.message, "boom"),
+        other => panic!("expected the terminal's error, got {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(GUARD, rx.next())
+            .await
+            .expect("no hang")
+            .is_none(),
+        "the injected second terminal must not surface"
+    );
 }

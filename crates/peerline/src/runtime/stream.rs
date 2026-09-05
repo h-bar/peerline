@@ -18,8 +18,8 @@ use std::task::{Context, Poll};
 /// Args for the reserved stream-cancel notification (see
 /// [`super::STREAM_CANCEL_OP`]) — carries just the stream id.
 #[derive(Serialize)]
-struct CancelArgs {
-    id: Id,
+pub(crate) struct CancelArgs {
+    pub(crate) id: Id,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,10 +252,14 @@ pub struct StreamItem<R> {
 ///
 /// Dropping this handle before the terminal cancels the stream: a
 /// reserved cancel notification tells the producer to stop, and the
-/// registry entry is removed so the dispatch loop silently discards
-/// any frames still in flight for this id. Once the stream has
+/// registry entry is removed so frames still in flight for this id no
+/// longer route anywhere — they are discarded, surfacing only through
+/// the opt-in [`Peer::on_protocol_error`] hook as `UnroutableFrame`
+/// (an expected race, not a misbehaving peer). Once the stream has
 /// finished (terminal seen), the entry is already gone and drop is a
 /// no-op.
+///
+/// [`Peer::on_protocol_error`]: super::Peer::on_protocol_error
 pub struct StreamReceiver<R> {
     id: Option<Id>,
     rx: mpsc::UnboundedReceiver<StreamFrame>,
@@ -302,6 +306,14 @@ impl<R: DeserializeOwned + Unpin> Stream for StreamReceiver<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // Fused on the terminal: `finish` took the id when the stream
+        // ended, and anything still queued behind that point (e.g. an
+        // error terminal a stray unary reply injected while the real
+        // terminal sat unpolled) must not surface — the contract is at
+        // most one final `Err`.
+        if this.id.is_none() {
+            return Poll::Ready(None);
+        }
         loop {
             match this.rx.poll_next_unpin(cx) {
                 Poll::Ready(Some(frame)) => {
@@ -360,7 +372,8 @@ impl<R> Drop for StreamReceiver<R> {
         // before user handlers and closes that stream's outbound queue,
         // so its handler's next send fails. Any frames still in flight
         // for this id are discarded locally (no registry entry left to
-        // route to). No-op if the stream already finished.
+        // route to) — visible only as `UnroutableFrame` on the opt-in
+        // protocol-error hook. No-op if the stream already finished.
         self.finish(true);
     }
 }

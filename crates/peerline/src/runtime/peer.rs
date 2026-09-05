@@ -62,6 +62,12 @@ pub(crate) struct PeerInner {
     /// route (see [`Peer::on_protocol_error`]). `None` — the default —
     /// discards them exactly as before.
     protocol_error_handler: Mutex<Option<ProtocolErrorHandler>>,
+    /// Mirrors `protocol_error_handler.is_some()`, set once a hook is
+    /// registered. All [`report`] sites are driven by remote-controlled
+    /// input, so in the default no-hook configuration they must not pay
+    /// a lock plus error construction per bad frame — this flag makes
+    /// that path two loads and a branch.
+    has_protocol_error_handler: AtomicBool,
     /// Fair outbound scheduler — control-priority queue plus per-stream
     /// round-robin queues (see [`super::outbound`]). Every outgoing
     /// frame routes through here; [`send_frame`] enqueues control
@@ -196,6 +202,7 @@ impl Peer {
             notification_handlers: Mutex::new(HashMap::new()),
             stream_handlers: Mutex::new(HashMap::new()),
             protocol_error_handler: Mutex::new(None),
+            has_protocol_error_handler: AtomicBool::new(false),
             outbound,
             inflight_handlers: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -337,17 +344,10 @@ impl Peer {
         let h: RequestHandler = Arc::new(move |args: serde_json::Value| {
             let f = f.clone();
             Box::pin(async move {
-                let a: A = serde_json::from_value(args).map_err(|e| RpcError {
-                    code: ErrorType::InvalidParams.into(),
-                    message: e.to_string(),
-                    data: None,
-                })?;
+                let a: A = serde_json::from_value(args)
+                    .map_err(|e| RpcError::invalid_params(e.to_string()))?;
                 let r = f(a).await?;
-                RawJson::from_serialize(&r).map_err(|e| RpcError {
-                    code: ErrorType::Internal.into(),
-                    message: e.to_string(),
-                    data: None,
-                })
+                RawJson::from_serialize(&r).map_err(|e| RpcError::internal(e.to_string()))
             })
         });
         self.inner
@@ -410,11 +410,11 @@ impl Peer {
                         Ok(()) => guard.send_normal(),
                         Err(e) => guard.send_error(e),
                     },
-                    Err(_) => guard.send_error(RpcError {
-                        code: ErrorType::InvalidParams.into(),
-                        message: "invalid args for stream request".into(),
-                        data: None,
-                    }),
+                    Err(_) => {
+                        guard.send_error(RpcError::invalid_params(
+                            "invalid args for stream request",
+                        ));
+                    }
                 }
             })
         });
@@ -439,6 +439,9 @@ impl Peer {
         F: Fn(ProtocolError) + Send + Sync + 'static,
     {
         *self.inner.protocol_error_handler.lock().unwrap() = Some(Arc::new(f));
+        self.inner
+            .has_protocol_error_handler
+            .store(true, Ordering::Release);
     }
 }
 
@@ -519,11 +522,7 @@ fn teardown(inner: &Arc<PeerInner>) {
     inner.closed.store(true, Ordering::SeqCst);
     let pending: Vec<_> = inner.pending.lock().unwrap().drain().collect();
     for (_id, tx) in pending {
-        let _ = tx.send(Err(RpcError {
-            code: ErrorType::Internal.into(),
-            message: "connection closed".into(),
-            data: None,
-        }));
+        let _ = tx.send(Err(RpcError::internal("connection closed")));
     }
     // Dropping the senders ends each receiver's stream, which is how a
     // `call_stream` consumer sees the connection go away.
@@ -538,14 +537,11 @@ fn on_inbound_text(
     let frame = match p::parse_frame(text) {
         Ok(f) => f,
         Err(parse_err_response) => {
-            report(
-                inner,
-                ProtocolError::MalformedFrame {
-                    message: parse_err_response
-                        .error()
-                        .map_or_else(String::new, |e| e.message.clone()),
-                },
-            );
+            report(inner, || ProtocolError::MalformedFrame {
+                message: parse_err_response
+                    .error()
+                    .map_or_else(String::new, |e| e.message.clone()),
+            });
             let _ = send_frame(inner, parse_err_response);
             return;
         }
@@ -556,12 +552,9 @@ fn on_inbound_text(
                 // `id: null` — the remote couldn't recover the id of the
                 // request it is answering, so neither can we. Nothing to
                 // resolve; surface it rather than drop it silently.
-                report(
-                    inner,
-                    ProtocolError::UncorrelatedResponse {
-                        error: outcome.err(),
-                    },
-                );
+                report(inner, || ProtocolError::UncorrelatedResponse {
+                    error: outcome.err(),
+                });
                 return;
             };
             if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
@@ -588,7 +581,7 @@ fn on_inbound_text(
                 ));
                 return;
             }
-            report(inner, ProtocolError::UnroutableFrame { id });
+            report(inner, || ProtocolError::UnroutableFrame { id });
         }
         InboundKind::IncomingRequest(req) => {
             let inner = inner.clone();
@@ -634,15 +627,23 @@ fn on_inbound_text(
             // remote handles the op as a stream. A unary waiter can only
             // take one value, so fail it — forwarding the stream's own
             // error when it is ending in one, since that says more than
-            // the shape complaint would. Later frames of the same stream
-            // find no waiter and report as unroutable.
+            // the shape complaint would. The producer doesn't know its
+            // reply shape lost, so cancel it exactly as a dropped
+            // `StreamReceiver` would — otherwise a long-lived handler
+            // keeps streaming for the rest of the connection. Frames
+            // already in flight find no waiter and report as unroutable.
             if let Some(tx) = inner.pending.lock().unwrap().remove(&id) {
+                if let Ok(notif) =
+                    p::notification(super::STREAM_CANCEL_OP, &super::stream::CancelArgs { id })
+                {
+                    let _ = send_frame(inner, notif);
+                }
                 let _ = tx.send(Err(sf.error.unwrap_or_else(|| {
                     violation("responder answered with a stream; use call_stream")
                 })));
                 return;
             }
-            report(inner, ProtocolError::UnroutableFrame { id });
+            report(inner, || ProtocolError::UnroutableFrame { id });
         }
     }
 }
@@ -665,20 +666,21 @@ fn unary_reply_to_stream_error(outcome: Result<RawJson, RpcError>) -> RpcError {
 /// declared. `Internal` because the fault is in the peers' agreement
 /// about the op, not in the request the caller sent.
 fn violation(message: &str) -> RpcError {
-    RpcError {
-        code: ErrorType::Internal.into(),
-        message: message.to_owned(),
-        data: None,
-    }
+    RpcError::internal(message)
 }
 
 /// Hand a [`ProtocolError`] to the peer's hook, if one is registered.
+/// Takes a constructor rather than the value so the default no-hook
+/// path (checked via the atomic flag, no lock) never builds the error.
 /// The hook is cloned out from under the lock so a slow (or reentrant)
 /// observer can't hold the registry.
-fn report(inner: &Arc<PeerInner>, err: ProtocolError) {
+fn report(inner: &Arc<PeerInner>, make: impl FnOnce() -> ProtocolError) {
+    if !inner.has_protocol_error_handler.load(Ordering::Acquire) {
+        return;
+    }
     let handler = inner.protocol_error_handler.lock().unwrap().clone();
     if let Some(handler) = handler {
-        handler(err);
+        handler(make());
     }
 }
 

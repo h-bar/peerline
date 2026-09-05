@@ -355,6 +355,31 @@ impl RpcError {
     pub fn error_type(&self) -> ErrorType {
         self.code.into()
     }
+
+    /// An [`ErrorType::Internal`]-coded error carrying `message` and no
+    /// data — the shape the runtime uses for faults in the peers' own
+    /// machinery (reply-shape violations, closed connections, failure
+    /// to serialize a handler's reply).
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorType::Internal.into(),
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// An [`ErrorType::InvalidParams`]-coded error carrying `message`
+    /// and no data — a request's args did not deserialize into what
+    /// the handler declared.
+    #[must_use]
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorType::InvalidParams.into(),
+            message: message.into(),
+            data: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
