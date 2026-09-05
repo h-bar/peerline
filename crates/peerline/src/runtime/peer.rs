@@ -303,7 +303,7 @@ impl Peer {
 
     /// Issue a streaming request. The returned [`StreamReceiver`]
     /// implements [`futures::Stream<Item = Result<R, Error>>`].
-    /// Dropping the receiver sends a `stream:cancel` upstream.
+    /// Dropping the receiver sends a `$peerline/stream.cancel` upstream.
     pub fn call_stream<A, R>(&self, op: &str, args: &A) -> Result<StreamReceiver<R>, Error>
     where
         A: Serialize,

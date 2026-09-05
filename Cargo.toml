@@ -24,8 +24,10 @@ resolver = "2"
 
 # Shared by every member, so a release bumps one line rather than five.
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
+# Let-chains (stabilized 1.88) are the newest language feature in use.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/h-bar/peerline"
 
@@ -34,7 +36,7 @@ repository = "https://github.com/h-bar/peerline"
 # writes into the published manifest. A path dependency without a version
 # cannot be packaged at all.
 [workspace.dependencies]
-peerline = { path = "crates/peerline", version = "0.0.6" }
-peerline-transport-ws = { path = "crates/peerline-transport-ws", version = "0.0.6" }
-peerline-transport-uds = { path = "crates/peerline-transport-uds", version = "0.0.6" }
-peerline-transport-iroh = { path = "crates/peerline-transport-iroh", version = "0.0.6" }
+peerline = { path = "crates/peerline", version = "0.0.7" }
+peerline-transport-ws = { path = "crates/peerline-transport-ws", version = "0.0.7" }
+peerline-transport-uds = { path = "crates/peerline-transport-uds", version = "0.0.7" }
+peerline-transport-iroh = { path = "crates/peerline-transport-iroh", version = "0.0.7" }

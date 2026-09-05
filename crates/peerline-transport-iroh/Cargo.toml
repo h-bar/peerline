@@ -1,10 +1,12 @@
 [package]
 name = "peerline-transport-iroh"
-description = "Iroh P2P (QUIC) transport for peerline — ticket codec, text framing, and a reusable accept-loop (`serve`) that drives a peerline `Peer` per bi-stream. The ALPN is caller-supplied so one host can run several peerline services; dial-side apps reach services through the iroh-pipe tunnel daemon."
+description = "Iroh P2P (QUIC) transport for peerline — ticket codec, text framing, and a reusable accept-loop (`serve`) that drives a peerline `Peer` per bi-stream. The ALPN is caller-supplied so one host can run several peerline services behind a single endpoint."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 keywords = ["rpc", "p2p", "quic", "iroh", "peerline"]
 categories = ["network-programming", "asynchronous"]
 

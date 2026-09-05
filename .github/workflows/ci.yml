@@ -29,6 +29,23 @@ jobs:
       # pull `runtime` in via feature unification, but don't rely on that.
       - run: cargo test --workspace --all-features
 
+  # `rust-version` in Cargo.toml is a promise; this job is what keeps it
+  # true — a dependency bump or a new language feature that silently
+  # raises the floor fails here instead of at a consumer. Check only:
+  # MSRV governs "does it build", not lints or tests.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    env:
+      # Older toolchains warn differently; -D warnings belongs to the
+      # stable lint job, not the MSRV floor check.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+
   # The published tarball is its own artifact: it has different contents from
   # the working tree (excludes, and files outside the package root), so it can
   # break while the workspace is green.

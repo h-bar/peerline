@@ -1,8 +1,8 @@
 //! Iroh P2P (QUIC) transport for peerline.
 //!
 //! Both ends of the peer link depend on this crate so they cannot drift:
-//! an accepting service and the native dial side (e.g. the iroh-pipe
-//! tunnel daemon). It owns:
+//! an accepting service and whatever dials it (a daemon, a CLI, another
+//! service). It owns:
 //!
 //! 1. [`encode_ticket`] / [`decode_ticket`] — [`TICKET_PREFIX`] + base32
 //!    of the postcard-encoded [`EndpointAddr`]. Both ends must pin the
@@ -10,14 +10,12 @@
 //! 2. [`text_frames`] — length-delimited `String` frames over a joined
 //!    QUIC duplex (a raw bi-stream has no message boundaries).
 //! 3. [`serve`] — the reusable accept loop: bind an endpoint, hand its
-//!    ticket back once, and drive a [`peerline::runtime::Peer`] per
-//!    accepted bi-stream, configured by a caller-supplied handler
-//!    closure. [`load_or_create_secret_key`] persists a stable identity.
+//!    ticket back once, screen each connection with a caller-supplied
+//!    acceptor, and drive a [`peerline::runtime::Peer`] per accepted
+//!    bi-stream. [`load_or_create_secret_key`] persists a stable identity.
 //! 4. [`connect`] — the native-Rust dial side: bind an ephemeral
 //!    endpoint, dial a ticket for a given ALPN, and return one
-//!    `(Peer, driver)`. (Tauri apps no longer dial per-service iroh
-//!    links directly — they reach services through the iroh-pipe
-//!    tunnel's loopback frontends.)
+//!    `(Peer, driver)`.
 //!
 //! The **ALPN is deliberately NOT owned here**: it names a *specific*
 //! service, and one host may run several peerline services behind a
@@ -363,10 +361,11 @@ impl IrohConfig {
 }
 
 /// Bind an iroh endpoint for `alpn` with the given identity, then run the
-/// accept loop forever: for each accepted bi-stream, build a
+/// accept loop forever: screen each connection with `acceptor`, and for
+/// each bi-stream of an admitted connection, build a
 /// [`peerline::runtime::Peer`] over the shared text framing, hand it to
-/// `on_peer` (register your handlers there), and drive it until the
-/// stream ends.
+/// the initializer the acceptor returned (register your handlers there),
+/// and drive it until the stream ends.
 ///
 /// `on_ticket` is called exactly once, after the endpoint binds, with the
 /// pasteable ticket — print or log it however the service prefers. The
@@ -632,6 +631,9 @@ pub async fn dial_plan(
 /// policy refused me" from "the network broke" without matching error
 /// strings. The seam a pairing flow needs: on [`ConnectError::Refused`],
 /// start pairing; on [`ConnectError::Other`], back off and retry.
+// `non_exhaustive`: refusal reporting will plausibly grow variants —
+// matchers must keep a wildcard arm.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnectError {
     /// The server's acceptor refused this endpoint: the QUIC connection
@@ -708,9 +710,7 @@ pub async fn connect(
     mode: DialMode,
 ) -> Result<(Peer, BoxFuture<'static, ()>), ConnectError> {
     let addr = decode_ticket(ticket).map_err(ConnectError::Other)?;
-    let (endpoint, peer_addr) = dial_plan(&addr, mode)
-        .await
-        .map_err(ConnectError::Other)?;
+    let (endpoint, peer_addr) = dial_plan(&addr, mode).await.map_err(ConnectError::Other)?;
     // A handshake failure is never a refusal: the acceptor only runs
     // once the handshake has fixed the dialer's identity and ALPN.
     let conn = endpoint

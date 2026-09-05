@@ -120,8 +120,20 @@ mod tests {
     #[test]
     fn checks_conjoin_in_order_and_first_refusal_wins() {
         let p = Policy::<u32>::allow_any()
-            .and(|n| if *n > 10 { Ok(()) } else { Err("too small".into()) })
-            .and(|n| if *n % 2 == 0 { Ok(()) } else { Err("odd".into()) });
+            .and(|n| {
+                if *n > 10 {
+                    Ok(())
+                } else {
+                    Err("too small".into())
+                }
+            })
+            .and(|n| {
+                if *n % 2 == 0 {
+                    Ok(())
+                } else {
+                    Err("odd".into())
+                }
+            });
         assert!(p.check(&12).is_ok());
         assert_eq!(p.check(&3).unwrap_err(), "too small");
         assert_eq!(p.check(&13).unwrap_err(), "odd");

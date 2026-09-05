@@ -8,7 +8,7 @@ level. Either endpoint may send any frame at any time, and both use the same
 API to call, notify, reply and open streams. A "server" that needs to ask its
 "client" a question just calls it.
 
-This is the Rust implementation. A TypeScript one, [`@yanz/peerline`], lives
+This is the Rust implementation. A TypeScript one, [`@h-bar/peerline`], lives
 in [`peerline-ts`], and the two are pinned to each other by a shared
 conformance suite rather than by good intentions — see
 [Conformance](#conformance).
@@ -77,7 +77,7 @@ that stops them lives in the sibling
 [`peerline-conformance`](https://github.com/h-bar/peerline-conformance)
 repository, which depends on this one — nothing here depends on it.
 
-It holds the contract and both languages' enforcement of it: 107 golden frame
+It holds the contract and both languages' enforcement of it: 108 golden frame
 vectors read by a Rust and a TypeScript parser check, and a live battery with
 one server and one client per language, so a cross-language run is one
 language's server paired with the other's client. It also owns the
@@ -90,7 +90,8 @@ languages at once.
 libs/
 ├── peerline/              this repo — the Rust implementation
 ├── peerline-ts/           the TypeScript implementation
-└── peerline-conformance/  the suite, which depends on both
+├── peerline-conformance/  the suite, which depends on both
+└── peerline-host/         the service layer, which depends on this repo
 ```
 
 ```sh
@@ -112,6 +113,6 @@ The toolchain is pinned to stable in `rust-toolchain.toml`.
 
 MIT.
 
-[`@yanz/peerline`]: https://www.npmjs.com/package/@yanz/peerline
+[`@h-bar/peerline`]: https://www.npmjs.com/package/@h-bar/peerline
 [`peerline-ts`]: https://github.com/h-bar/peerline-ts
 

@@ -41,7 +41,7 @@ internal dependencies, so it is the only one verifiable before a release.
 
 ## npm
 
-`@yanz/peerline` releases from the `peerline-ts` repository; see its README.
+`@h-bar/peerline` releases from the `peerline-ts` repository; see its README.
 
 ## Before any release
 

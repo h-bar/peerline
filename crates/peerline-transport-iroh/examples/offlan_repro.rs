@@ -3,7 +3,8 @@
 //! addresses — the exact addr an off-LAN client sees after decoding a
 //! ticket whose direct addrs are another network's LAN IPs.
 //!
-//! Run: cargo run --example offlan_repro [relay-url]
+//! Run: cargo run --example offlan_repro <relay-url>
+//! (a relay you operate, e.g. `http://relay.example:3340`)
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -24,9 +25,9 @@ async fn main() {
         )
         .init();
 
-    let relay = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://106.15.43.194:3340".to_string());
+    let relay = std::env::args().nth(1).expect(
+        "usage: offlan_repro <relay-url> — a relay you operate, e.g. http://relay.example:3340",
+    );
     let cfg = IrohConfig::from_relay_urls([relay.as_str()]).expect("relay url");
 
     // Acceptor: homed on the custom relay, serving ALPN.

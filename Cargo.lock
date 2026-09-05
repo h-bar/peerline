@@ -2335,7 +2335,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peerline"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "futures",
  "serde",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-iroh"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-uds"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "futures",
  "peerline",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transport-ws"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "axum",
  "futures",

@@ -3,8 +3,10 @@ name = "peerline-transport-uds"
 description = "Unix-domain-socket transport for peerline — a reusable accept-loop (`serve`) that drives a peerline `Peer` per connection over newline-delimited JSON frames. For local tooling on one host."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 keywords = ["rpc", "unix-socket", "ipc", "transport", "peerline"]
 categories = ["network-programming", "asynchronous"]
 

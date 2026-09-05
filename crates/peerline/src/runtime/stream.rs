@@ -27,7 +27,7 @@ pub(crate) struct CancelArgs {
 // ---------------------------------------------------------------------------
 
 /// Handle a server-side streaming handler uses to push items back
-/// to the requesting peer. Construct via [`crate::Peer::on_stream_request`]
+/// to the requesting peer. Construct via [`crate::runtime::Peer::on_stream_request`]
 /// — the handler receives one of these to send into.
 ///
 /// Owns a monotonic `seq` counter, incremented for every
@@ -39,7 +39,7 @@ pub(crate) struct CancelArgs {
 /// The handler does **not** explicitly close or error the stream —
 /// the stream's terminal frame is sent automatically by the runtime
 /// based on the handler's return value (`Ok(())` for normal end,
-/// `Err(rpc_err)` for abnormal end). See [`crate::Peer::on_stream_request`].
+/// `Err(rpc_err)` for abnormal end). See [`crate::runtime::Peer::on_stream_request`].
 pub struct StreamSender {
     pub(crate) id: Id,
     /// Shared scheduler — used for depth accounting and (by the runtime

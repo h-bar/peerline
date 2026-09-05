@@ -62,8 +62,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// representation on every parse and cannot capture payloads as
 /// [`serde_json::value::RawValue`]. The manual impls dispatch on the
 /// tags directly and funnel deserialization through the flat
-/// [`v1::WireV1`] view, so the `data` payload is captured raw and parsed
+/// `v1::WireV1` view, so the `data` payload is captured raw and parsed
 /// once, at the typed boundary.
+// `non_exhaustive` is what makes the documented promise true: adding a
+// `V2(v2::Content)` variant must be purely additive, which an exhaustive
+// public enum would turn into a semver break for matchers.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// v1 frame (the current and only version).

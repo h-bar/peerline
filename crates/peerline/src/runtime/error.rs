@@ -4,6 +4,9 @@ use crate::wire::RpcError;
 use thiserror::Error;
 
 /// Errors surfaced by [`super::Peer`] methods.
+// `non_exhaustive`: the runtime may grow failure classes without a
+// semver break.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum Error {
     /// The peer returned an RPC error response.

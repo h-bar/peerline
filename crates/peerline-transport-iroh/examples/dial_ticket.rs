@@ -141,7 +141,7 @@ async fn main() {
         // relay plus such refusing addrs only (no reachable directs).
         let refusing: Vec<std::net::SocketAddr> = vec![
             "127.0.0.1:9".parse().unwrap(),
-            "192.168.31.1:6466".parse().unwrap(), // this LAN's router, closed port
+            "192.168.1.1:6466".parse().unwrap(), // a typical LAN gateway, closed port
         ];
         let mut hostile = relays.iter().fold(EndpointAddr::from(addr.id), |a, r| {
             a.with_relay_url(r.clone())

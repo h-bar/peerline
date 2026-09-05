@@ -10,7 +10,7 @@ API to call, notify, reply and open streams.
 
 ```toml
 [dependencies]
-peerline = { version = "0.0.6", features = ["runtime"] }
+peerline = { version = "0.0.7", features = ["runtime"] }
 ```
 
 ## Wire format
@@ -43,8 +43,9 @@ error. All frames correlate to the originating request by `id`.
   request, a notification or a stream frame. Outgoing builders and
   `RequestIdGen` cover the send side. No state, no I/O.
 - **`pubsub`** — subscription layer on top of the core. Subscribe RPCs return
-  a `SubscriptionAck`; the pushing peer sends `event` / `end` notifications;
-  the receiver cancels with an `unsubscribe` request.
+  a `SubscriptionAck`; the pushing peer sends notifications on the reserved
+  `$peerline/pubsub.event` / `$peerline/pubsub.end` ops; the receiver
+  cancels with a `$peerline/pubsub.unsubscribe` request.
 - **`runtime`** *(feature `runtime`)* — the stateful `Peer`: pending-request
   map, handler registry, stream registry, outbound channel. Built on
   `futures::channel`, so it is runtime-agnostic — tokio, async-std, smol and
@@ -72,7 +73,8 @@ before a frame is rejected.
 
 ## Wire compatibility
 
-A TypeScript implementation, [`@yanz/peerline`], lives in the same repository
+A TypeScript implementation, [`@h-bar/peerline`], lives in the sibling
+`peerline-ts` repository
 and is pinned to this crate by golden frame vectors both parsers read and by a
 live interop battery run over a real WebSocket in both directions. That suite
 is a separate repository, [`peerline-conformance`], which depends on this
@@ -86,5 +88,5 @@ MIT.
 [`peerline-transport-ws`]: https://crates.io/crates/peerline-transport-ws
 [`peerline-transport-uds`]: https://crates.io/crates/peerline-transport-uds
 [`peerline-transport-iroh`]: https://crates.io/crates/peerline-transport-iroh
-[`@yanz/peerline`]: https://www.npmjs.com/package/@yanz/peerline
+[`@h-bar/peerline`]: https://www.npmjs.com/package/@h-bar/peerline
 [`peerline-conformance`]: https://github.com/h-bar/peerline-conformance

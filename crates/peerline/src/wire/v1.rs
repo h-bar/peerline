@@ -7,9 +7,9 @@
 //! intermediate representation on every parse and, fatally, cannot
 //! capture payloads as [`serde_json::value::RawValue`] — the frame's
 //! [`Serialize`] / [`Deserialize`] are hand-written (see [`crate::wire`]).
-//! Deserialization funnels through the flat [`WireV1`] view, whose `data`
+//! Deserialization funnels through the flat `WireV1` view, whose `data`
 //! field is captured raw and only parsed at the typed boundary;
-//! [`content_from_wire`] then validates per-`kind` and builds the typed
+//! `content_from_wire` then validates per-`kind` and builds the typed
 //! [`Content`]. (`args` is captured raw by that view too, but the same
 //! mapping step materializes it into a [`Params`] map — the
 //! envelope's declared type — so a request payload does pay a

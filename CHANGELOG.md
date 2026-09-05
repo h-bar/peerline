@@ -4,7 +4,10 @@ All crates in this workspace share one version and one changelog. The
 TypeScript package (`peerline-ts`) versions itself but tracks the same
 wire contract; wire-affecting entries below call that out.
 
-## Unreleased
+## 0.0.7 — 2026-09-05
+
+First published release. Everything below landed since the repository
+split at 0.0.6 (which was never published to crates.io).
 
 ### Breaking
 
@@ -45,6 +48,11 @@ wire contract; wire-affecting entries below call that out.
 
 ### Changed
 
+- **Stream `seq` past `i64::MAX` is rejected** instead of wrapping
+  silently — a peer-visible tightening on the wire: frames a buggy
+  producer previously slipped through as wrapped sequence numbers now
+  fail parsing. The remaining wire envelopes also derive `PartialEq`
+  (purely additive).
 - **UDS sockets publish owner-only, atomically**: the socket is bound
   and `chmod`ed under a staging name and renamed into place, so the
   advertised path never exists in a permissive state. **Deployment

@@ -1,4 +1,4 @@
-//! Stateful [`Peer`] built on the pure helpers in
+//! Stateful [`Peer`](crate::runtime::Peer) built on the pure helpers in
 //! [`crate::peer`] / [`crate::wire`]. Opt in via the `runtime`
 //! feature.
 //!
@@ -18,7 +18,7 @@
 //!   the caller-supplied transport sink, so one busy stream can't
 //!   head-of-line-block control traffic or its siblings.
 //!
-//! Construction binds the peer to its transport: [`Peer::new`]
+//! Construction binds the peer to its transport: [`Peer::new`](crate::runtime::Peer::new)
 //! takes a `Sink<String>` plus a `Stream<Item = Result<String, _>>`
 //! and returns both the peer handle and a *driver future* the
 //! caller awaits or spawns. The driver runs the dispatch loop
@@ -29,11 +29,13 @@
 //!
 //! ### Cancel-on-drop streams
 //!
-//! Returned [`StreamReceiver`]s send a reserved cancel notification
-//! ([`STREAM_CANCEL_OP`]) and remove themselves from the registry when
+//! Returned [`StreamReceiver`](crate::runtime::StreamReceiver)s send a
+//! reserved cancel notification (`$peerline/stream.cancel`) and remove
+//! themselves from the registry when
 //! dropped; the producing peer intercepts it and closes that stream's
 //! outbound queue, so the handler's next send fails. A handler can also
-//! await [`StreamSender::cancelled`] to stop expensive upstream work
+//! await [`StreamSender::cancelled`](crate::runtime::StreamSender::cancelled)
+//! to stop expensive upstream work
 //! the moment the consumer leaves, without waiting for its next send.
 //! The consumer gets gRPC-flavoured "drop the handle and the server
 //! stops producing" semantics for free.

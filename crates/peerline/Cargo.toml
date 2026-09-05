@@ -3,11 +3,17 @@ name = "peerline"
 description = "Peer-symmetric bidirectional RPC toolkit — typed request/response/notification/stream envelopes with a pubsub layer, version-tagged JSON wire format, plus an optional stateful Peer runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
 keywords = ["rpc", "bidirectional", "peer-to-peer", "streaming", "protocol"]
 categories = ["network-programming", "asynchronous", "encoding"]
+
+# docs.rs builds with the runtime on — otherwise the crate's main API
+# (Peer, Policy, streaming) would be invisible there.
+[package.metadata.docs.rs]
+features = ["runtime"]
 
 [features]
 default = []

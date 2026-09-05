@@ -441,6 +441,10 @@ async fn serve_conn(socket: WebSocket, init: PeerHandler) {
 /// policy refused me" from "the network broke" without matching error
 /// strings, and react accordingly (surface "not allowed", start an
 /// authorization flow) instead of blindly retrying.
+// `non_exhaustive`: refusal reporting will plausibly grow variants
+// (TLS identity, timeout classification) — matchers must keep a
+// wildcard arm.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnectError {
     /// The server answered the handshake with **403** instead of
@@ -715,8 +719,7 @@ mod tests {
         let server = tokio::spawn(async move {
             serve(
                 addr,
-                WsPolicy::custom(|_: &WsAccept| Err("nobody today".into()))
-                    .acceptor(|_: &Peer| {}),
+                WsPolicy::custom(|_: &WsAccept| Err("nobody today".into())).acceptor(|_: &Peer| {}),
             )
             .await
         });

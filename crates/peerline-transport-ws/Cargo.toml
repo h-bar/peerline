@@ -1,10 +1,12 @@
 [package]
 name = "peerline-transport-ws"
-description = "WebSocket transport for peerline (axum) — a self-contained accept-loop (`serve`) that binds an address, upgrades browser clients, and drives a peerline `Peer` per connection. axum is fully encapsulated: callers pass an address + handler closure, no axum types cross the boundary."
+description = "WebSocket transport for peerline (axum) — a self-contained accept-loop (`serve`) that binds an address, upgrades browser clients, and drives a peerline `Peer` per connection. axum is fully encapsulated: callers pass an address + admission acceptor, no axum types cross the boundary."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 keywords = ["rpc", "websocket", "transport", "peerline", "axum"]
 categories = ["network-programming", "asynchronous", "web-programming::websocket"]
 

@@ -18,10 +18,11 @@ const PROBE_ALPN: &[u8] = b"peerline/probe/1";
 async fn main() {
     let urls: Vec<String> = std::env::args().skip(1).collect();
     let urls = if urls.is_empty() {
+        // Pass your own URLs as args to probe real hosts (e.g. a
+        // reachable relay on a closed port, which answers with RST).
         vec![
-            "http://127.0.0.1:9".to_string(),        // closed port -> RST
-            "http://192.0.2.1:3340".to_string(),     // blackhole -> timeout
-            "http://106.15.43.194:9999".to_string(), // real host, closed port
+            "http://127.0.0.1:9".to_string(),    // closed port -> RST
+            "http://192.0.2.1:3340".to_string(), // blackhole -> timeout
         ]
     } else {
         urls

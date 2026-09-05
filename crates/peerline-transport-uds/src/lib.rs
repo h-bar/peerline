@@ -376,8 +376,7 @@ async fn ensure_staging_is_not_a_symlink(staging: &Path) -> Result<(), String> {
 /// sweep is hygiene, and the staging name this bind actually uses is
 /// cleared separately with a hard error.
 async fn sweep_stale_staging(path: &Path) {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
-    else {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return;
     };
     let prefix = format!("{name}.");

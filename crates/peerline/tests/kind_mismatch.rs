@@ -455,7 +455,9 @@ async fn stray_reply_behind_a_queued_terminal_does_not_yield_a_second_error() {
     // Sequencing marker: dispatch is in-order, so once this unroutable
     // frame is reported, both frames above have been dispatched.
     in_tx
-        .send(Ok(r#"{"ver":"1","kind":"resp","id":999999,"data":1}"#.into()))
+        .send(Ok(
+            r#"{"ver":"1","kind":"resp","id":999999,"data":1}"#.into()
+        ))
         .await
         .expect("send");
     match tokio::time::timeout(GUARD, seen_rx.next())
