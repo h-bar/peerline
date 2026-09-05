@@ -87,7 +87,7 @@ types, since regenerating them is the one job that needs to see both
 languages at once.
 
 ```
-libs/
+peerline/                  (any parent folder)
 ├── peerline/              this repo — the Rust implementation
 ├── peerline-ts/           the TypeScript implementation
 ├── peerline-conformance/  the suite, which depends on both
