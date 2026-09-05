@@ -67,8 +67,9 @@
 //!   [`peer::RequestIdGen`] cover the send-side.
 //! - [`pubsub`] — pubsub-subscription layer. Subscribe RPCs return
 //!   a [`pubsub::SubscriptionAck`]; the pushing peer sends
-//!   [`wire::Notification`]s with method `"event"` / `"end"`; the
-//!   receiving peer cancels with an `unsubscribe` request. Layered
+//!   [`wire::Notification`]s on the reserved `$peerline/pubsub.*`
+//!   ops ([`pubsub::EVENT_OP`] / [`pubsub::END_OP`]); the receiving
+//!   peer cancels with a [`pubsub::UNSUBSCRIBE_OP`] request. Layered
 //!   on top of the core — pass any
 //!   [`peer::InboundKind::IncomingNotification`] through
 //!   [`pubsub::classify`] to recognise pubsub messages.

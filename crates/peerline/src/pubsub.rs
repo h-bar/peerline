@@ -4,19 +4,19 @@
 //! Layers cleanly on top of [`crate::wire`] / [`crate::peer`]
 //! without modifying them. Under peerline's peer-symmetric model,
 //! either peer can send a [`Notification`] — so subscription pushes
-//! are just notifications on the `"event"` / `"end"` method names.
-//! No separate "event" wire type is needed.
+//! are just notifications on the reserved [`EVENT_OP`] / [`END_OP`]
+//! op names. No separate "event" wire type is needed.
 //!
 //! ### Wire conventions
 //!
 //! - Subscribe RPC (application-named, e.g. `"subscribe"`) returns
 //!   [`SubscriptionAck`] in `result`.
 //! - The pushing peer emits [`Notification`] frames with
-//!   `method == "event"` carrying [`EventParams`] (per-subscription
-//!   event), and optionally one `method == "end"` with [`EndParams`]
+//!   `op == `[`EVENT_OP`] carrying [`EventParams`] (per-subscription
+//!   event), and optionally one `op == `[`END_OP`] with [`EndParams`]
 //!   when a bounded stream completes.
-//! - The receiving peer cancels with an `unsubscribe` request whose
-//!   params are [`UnsubscribeParams`].
+//! - The receiving peer cancels with an [`UNSUBSCRIBE_OP`] request
+//!   whose params are [`UnsubscribeParams`].
 //!
 //! ### Client-side classification
 //!
@@ -33,27 +33,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // Reserved op names
 // ---------------------------------------------------------------------------
 //
-// These are plain, un-namespaced op names — unlike the runtime's
-// `$peerline/stream.cancel`, which is prefixed precisely so it cannot
-// collide. They are part of the cross-language wire contract (the
-// TypeScript implementation and the conformance vectors both hard-code
-// them), so they cannot be renamed from this crate alone. Naming them
-// here at least gives callers a way to *avoid* the collision: an
-// application whose own op set includes `event` or `end` can compare
-// against these constants instead of duplicating the literals.
+// `$peerline/`-prefixed, like the runtime's `$peerline/stream.cancel`,
+// so they cannot collide with application op names — an app is free to
+// have its own `event`, `end`, or `unsubscribe`. These are part of the
+// cross-language wire contract: the TypeScript implementation and the
+// conformance vectors pin the same literals, and any change here must
+// land in both. (They were once the bare names `event`/`end`/
+// `unsubscribe`; that spelling occupied the application namespace and
+// was retired before anything external shipped against it.)
 
-/// Op name of a pubsub event push. **Occupies the application op
-/// namespace** — an app that registers its own `event` handler will
-/// shadow / be shadowed by pubsub pushes on the same peer.
-pub const EVENT_OP: &str = "event";
+/// Op name of a pubsub event push.
+pub const EVENT_OP: &str = "$peerline/pubsub.event";
 
-/// Op name of the end-of-subscription push. Same namespace caveat as
-/// [`EVENT_OP`].
-pub const END_OP: &str = "end";
+/// Op name of the end-of-subscription push.
+pub const END_OP: &str = "$peerline/pubsub.end";
 
-/// Op name of the unsubscribe request. Same namespace caveat as
-/// [`EVENT_OP`].
-pub const UNSUBSCRIBE_OP: &str = "unsubscribe";
+/// Op name of the unsubscribe request. Unlike the pushes this is an
+/// ordinary request the receiving peer answers — reserved-prefixed only
+/// so the whole pubsub vocabulary stays out of the application's way.
+pub const UNSUBSCRIBE_OP: &str = "$peerline/pubsub.unsubscribe";
 
 // ---------------------------------------------------------------------------
 // Wire envelopes
@@ -69,7 +67,7 @@ pub struct SubscriptionAck {
     pub subscription_id: String,
 }
 
-/// Params of an `event` notification: the subscription it belongs
+/// Params of an [`EVENT_OP`] notification: the subscription it belongs
 /// to plus one event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -81,7 +79,7 @@ pub struct EventParams {
     pub event: Value,
 }
 
-/// Params of an `end` notification — sent once when a bounded
+/// Params of an [`END_OP`] notification — sent once when a bounded
 /// subscription stream completes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -91,7 +89,7 @@ pub struct EndParams {
     pub subscription_id: String,
 }
 
-/// Params of an `unsubscribe` request.
+/// Params of an [`UNSUBSCRIBE_OP`] request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
@@ -113,8 +111,8 @@ pub fn subscription_ack(subscription_id: impl Into<String>) -> SubscriptionAck {
     }
 }
 
-/// Build an `event` [`Notification`] wrapping the caller's payload
-/// in an [`EventParams`] envelope.
+/// Build an [`EVENT_OP`] [`Notification`] wrapping the caller's
+/// payload in an [`EventParams`] envelope.
 pub fn event<T: Serialize>(
     subscription_id: impl Into<String>,
     payload: &T,
@@ -129,7 +127,7 @@ pub fn event<T: Serialize>(
     })
 }
 
-/// Build an `end` [`Notification`] marking the end of a bounded
+/// Build an [`END_OP`] [`Notification`] marking the end of a bounded
 /// subscription stream.
 #[must_use]
 pub fn end(subscription_id: impl Into<String>) -> Notification {
@@ -168,7 +166,7 @@ impl SubscriptionIdGen {
 // Client-side helpers (the receiving peer)
 // ---------------------------------------------------------------------------
 
-/// Build an `unsubscribe` request for the given subscription id.
+/// Build an [`UNSUBSCRIBE_OP`] request for the given subscription id.
 #[must_use]
 pub fn unsubscribe_request(id: impl Into<Id>, subscription_id: impl Into<String>) -> Request {
     peer::request(
@@ -184,7 +182,7 @@ pub fn unsubscribe_request(id: impl Into<Id>, subscription_id: impl Into<String>
 /// A pubsub-method message, decoded by [`classify`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum PubsubMessage {
-    /// One event on a live subscription (method = `"event"`).
+    /// One event on a live subscription (op = [`EVENT_OP`]).
     Event {
         /// The subscription this event belongs to.
         subscription_id: String,
@@ -193,34 +191,35 @@ pub enum PubsubMessage {
         event: Value,
     },
     /// End-of-stream marker for a bounded subscription
-    /// (method = `"end"`).
+    /// (op = [`END_OP`]).
     End {
         /// The subscription that has ended.
         subscription_id: String,
     },
 }
 
-/// Recognise a [`Notification`] as a pubsub `event` or `end`
+/// Recognise a [`Notification`] as a pubsub [`EVENT_OP`] or [`END_OP`]
 /// message. Returns `Some(PubsubMessage)` if the op matches and the
 /// args deserialize cleanly; `None` otherwise.
+///
+/// The fields are read out of the args map directly rather than
+/// through `serde_json::from_value` on a clone of it — this runs once
+/// per delivered event, and cloning the whole map would double the
+/// payload's allocation traffic just to throw the copy away.
 pub fn classify(notif: &Notification) -> Option<PubsubMessage> {
+    let is_event = notif.op == EVENT_OP;
+    if !is_event && notif.op != END_OP {
+        return None;
+    }
     let args_obj = notif.args.as_ref()?;
-    let args_value = Value::Object(args_obj.clone());
-    match notif.op.as_str() {
-        EVENT_OP => {
-            let e: EventParams = serde_json::from_value(args_value).ok()?;
-            Some(PubsubMessage::Event {
-                subscription_id: e.subscription_id,
-                event: e.event,
-            })
-        }
-        END_OP => {
-            let e: EndParams = serde_json::from_value(args_value).ok()?;
-            Some(PubsubMessage::End {
-                subscription_id: e.subscription_id,
-            })
-        }
-        _ => None,
+    let subscription_id = args_obj.get("subscription_id")?.as_str()?.to_owned();
+    if is_event {
+        Some(PubsubMessage::Event {
+            subscription_id,
+            event: args_obj.get("event")?.clone(),
+        })
+    } else {
+        Some(PubsubMessage::End { subscription_id })
     }
 }
 

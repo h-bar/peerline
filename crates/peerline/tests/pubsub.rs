@@ -8,13 +8,13 @@ use serde_json::{Map, json};
 #[test]
 fn event_helper_returns_notification_with_op_event() {
     let n = pubsub::event("sub-0", &json!({"hello": "world"})).unwrap();
-    assert_eq!(n.op, "event");
+    assert_eq!(n.op, "$peerline/pubsub.event");
 }
 
 #[test]
 fn end_helper_returns_notification_with_op_end() {
     let n = pubsub::end("sub-9");
-    assert_eq!(n.op, "end");
+    assert_eq!(n.op, "$peerline/pubsub.end");
 }
 
 #[test]
@@ -51,9 +51,13 @@ fn classify_returns_none_for_non_pubsub_op() {
 }
 
 #[test]
-fn classify_returns_none_for_event_with_malformed_args() {
+fn classify_ignores_the_legacy_bare_names() {
+    // An application op literally named "event" is the collision the
+    // `$peerline/` prefix exists to prevent — even with pubsub-shaped
+    // args it must not classify as a pubsub push.
     let mut args = Map::new();
-    args.insert("event".into(), json!("x"));
+    args.insert("subscription_id".into(), json!("sub-0"));
+    args.insert("event".into(), json!({"x": 1}));
     let n = Notification {
         op: "event".into(),
         args: Some(args),
@@ -62,9 +66,20 @@ fn classify_returns_none_for_event_with_malformed_args() {
 }
 
 #[test]
+fn classify_returns_none_for_event_with_malformed_args() {
+    let mut args = Map::new();
+    args.insert("event".into(), json!("x"));
+    let n = Notification {
+        op: pubsub::EVENT_OP.into(),
+        args: Some(args),
+    };
+    assert!(pubsub::classify(&n).is_none());
+}
+
+#[test]
 fn classify_returns_none_for_event_without_args() {
     let n = Notification {
-        op: "event".into(),
+        op: pubsub::EVENT_OP.into(),
         args: None,
     };
     assert!(pubsub::classify(&n).is_none());
@@ -81,7 +96,7 @@ fn subscription_id_gen_is_monotonic() {
 #[test]
 fn unsubscribe_request_builds_with_typed_id() {
     let req = pubsub::unsubscribe_request(5u64, "sub-3");
-    assert_eq!(req.op, "unsubscribe");
+    assert_eq!(req.op, "$peerline/pubsub.unsubscribe");
     assert_eq!(req.id, 5u64);
     let args = req.args.expect("unsubscribe carries args");
     assert_eq!(
